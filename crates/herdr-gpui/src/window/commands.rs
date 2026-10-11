@@ -227,7 +227,9 @@ impl HerdrWindow {
                         endpoint.generation,
                         endpoint.connection.inbox.clone(),
                     );
-                    self.click_toast(&origin, generation, &inbox, id, cx);
+                    if self.click_toast(&origin, generation, &inbox, id, cx) {
+                        window.focus(&self.focus, cx);
+                    }
                 }
                 return;
             }

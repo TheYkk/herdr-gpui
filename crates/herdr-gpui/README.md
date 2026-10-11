@@ -2255,7 +2255,8 @@ notification where the platform allows. When several windows are attached to the
 same host, an event is posted once.
 
 Clicking a notification brings the app and its window forward and opens the
-target pane, tab, or workspace through the same validation as a toast click. It
+target pane, tab, or workspace through the same validation as a toast click, and
+the terminal takes the keyboard back, as after a sidebar click. It
 only focuses the window when that connection has since reconnected, the daemon
 restarted, the target is gone, or a menu page is open. Clicks are handled only
 while the GUI runs: a click cannot reopen a closed window.

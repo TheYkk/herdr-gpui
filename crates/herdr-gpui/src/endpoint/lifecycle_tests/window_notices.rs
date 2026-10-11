@@ -67,8 +67,18 @@ fn system_notification_click_opens_its_origin_and_rejects_a_reconnect(
         tag: shown.tag.clone(),
         action_id: None,
     };
+    let elsewhere = cx.update(|window, cx| {
+        let handle = cx.focus_handle();
+        window.focus(&handle, cx);
+        handle
+    });
     cx.simulate_system_notification_response(response.clone());
     cx.run_until_parked();
+    // The terminal is opened, so it takes the keyboard back.
+    cx.update(|window, cx| {
+        assert!(!elsewhere.is_focused(window));
+        assert!(view.read(cx).focus.is_focused(window));
+    });
     view.update(cx, |view, _| {
         assert_eq!(view.selected_endpoint, 1);
         assert_eq!(

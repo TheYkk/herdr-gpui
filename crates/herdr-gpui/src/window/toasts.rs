@@ -17,23 +17,25 @@ impl HerdrWindow {
         inbox: &std::sync::Arc<std::sync::Mutex<crate::state::LiveState>>,
         id: u64,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if self.menu.page.is_some() || self.toasts_hidden {
-            return;
+            return false;
         }
         let Some(index) = self.endpoints.iter().position(|e| {
             e.id == endpoint_id
                 && e.generation == generation
                 && std::sync::Arc::ptr_eq(&e.connection.inbox, inbox)
         }) else {
-            return;
+            return false;
         };
-        self.open_notice(index, id, cx);
+        self.open_notice(index, id, cx)
     }
 
     /// Selects the notice's host and navigates once its inbox validates the
-    /// target, for a toast click and an OS notification click alike.
-    pub(super) fn open_notice(&mut self, index: usize, id: u64, cx: &mut Context<Self>) {
+    /// target, for a toast click and an OS notification click alike. Returns
+    /// whether a target was accepted, so the caller can hand the keyboard to
+    /// the terminal it just opened, as a sidebar click does.
+    pub(super) fn open_notice(&mut self, index: usize, id: u64, cx: &mut Context<Self>) -> bool {
         let target = match self.toast_target(index, id) {
             Poll::Ready(target) => target,
             Poll::Pending => {
@@ -52,16 +54,17 @@ impl HerdrWindow {
             }
         };
         let Some(target) = target else {
-            return;
+            return false;
         };
         let endpoint_id = self.endpoints[index].id.clone();
         if !self.select_endpoint(&endpoint_id, cx) {
-            return;
+            return false;
         }
         self.pending_navigation = Some(target);
         self.pending_toast = Some(id);
         self.navigate_toast(id, cx);
         cx.notify();
+        true
     }
 
     pub(crate) fn toast_target(
@@ -307,9 +310,11 @@ impl HerdrWindow {
                         .on_click({
                             let endpoint_id = endpoint_id.clone();
                             let inbox = inbox.clone();
-                            cx.listener(move |this, _, _, cx| {
+                            cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.click_toast(&endpoint_id, generation, &inbox, id, cx);
+                                if this.click_toast(&endpoint_id, generation, &inbox, id, cx) {
+                                    window.focus(&this.focus, cx);
+                                }
                             })
                         })
                         .child(
