@@ -7,8 +7,8 @@ use super::*;
 pub(crate) enum ProviderEdit {
     Enable(&'static str),
     Disable(&'static str),
-    EnableAll,
-    DisableAll,
+    EnableMany([bool; crate::usage::PROVIDER_COUNT]),
+    DisableMany([bool; crate::usage::PROVIDER_COUNT]),
 }
 
 /// Lists longer than this are written one id per line.
@@ -44,12 +44,16 @@ pub(super) fn hide_providers(
                 hidden.push(id.to_owned());
             }
         }
-        ProviderEdit::EnableAll => {
-            hidden.retain(|id| !crate::usage::providers().any(|known| known.id() == id));
+        ProviderEdit::EnableMany(selected) => {
+            hidden.retain(|id| {
+                !crate::usage::providers()
+                    .zip(selected)
+                    .any(|(provider, selected)| selected && provider.id() == id)
+            });
         }
-        ProviderEdit::DisableAll => {
-            for provider in crate::usage::providers() {
-                if !hidden.iter().any(|hidden| hidden == provider.id()) {
+        ProviderEdit::DisableMany(selected) => {
+            for (provider, selected) in crate::usage::providers().zip(selected) {
+                if selected && !hidden.iter().any(|hidden| hidden == provider.id()) {
                     hidden.push(provider.id().to_owned());
                 }
             }

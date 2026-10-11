@@ -1,19 +1,80 @@
 //! Settings > Status bar > Usage services: which AI services Herdr reads plan
-//! usage for. A turned-off service is never probed, so its sign-in is not read
-//! and nothing is sent to it.
+//! usage for. Disabled services permit only installation metadata checks,
+//! never credential reads or provider requests.
 use super::*;
 use crate::{
+    HerdrWindow,
     config::{preferences::Preference, usage_providers::ProviderEdit},
     usage,
 };
 
 impl SettingsWindow {
+    pub(in crate::settings_window) fn sync_usage_provider_controls(
+        &mut self,
+        source: &Entity<HerdrWindow>,
+        refresh: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let target_changed = {
+            let source = source.read(cx);
+            source
+                .endpoints
+                .get(source.selected_endpoint)
+                .is_some_and(|endpoint| {
+                    source
+                        .usage
+                        .discovery_target_changed(&endpoint.connection.target)
+                })
+        };
+        if refresh
+            || target_changed
+            || source
+                .read(cx)
+                .integration_scope_changed(self.usage_provider_scope.as_ref())
+        {
+            self.usage_provider_scope = source.read(cx).integration_scope().ok();
+            source.update(cx, |source, cx| {
+                source.load_integrations(cx);
+                if let Some(endpoint) = source.endpoints.get(source.selected_endpoint) {
+                    source.usage.request_discovery(&endpoint.connection.target);
+                }
+            });
+        }
+        let source = source.read(cx);
+        let mut selected = source.installed_usage_providers();
+        if let Some(endpoint) = source.endpoints.get(source.selected_endpoint) {
+            let target = &endpoint.connection.target;
+            let installed = source.usage.installed_for_target(target);
+            for (displayed, installed) in selected.iter_mut().zip(installed) {
+                *displayed |= installed;
+            }
+            if let Some(entry) = source.usage.for_target(target) {
+                for provider in entry.detected() {
+                    if let Some(index) = usage::providers().position(|known| known == provider) {
+                        selected[index] = true;
+                    }
+                }
+            }
+        }
+        if selected == self.usage_providers {
+            return false;
+        }
+        self.usage_providers = selected;
+        true
+    }
+
     pub(super) fn render_usage_provider_controls(&self, cx: &mut Context<Self>) -> Div {
         let config = &self.config.usage;
         let on = config.show;
+        let selected = self.usage_providers;
+        let mut total = 0;
         let mut chips = div().flex().flex_wrap().gap(px(8.));
         let mut enabled = 0;
-        for provider in usage::providers() {
+        for (provider, displayed) in usage::providers().zip(selected) {
+            if !displayed {
+                continue;
+            }
+            total += 1;
             let id = provider.id();
             let active = !config.hidden(provider);
             enabled += usize::from(active);
@@ -26,6 +87,13 @@ impl SettingsWindow {
             chips = chips.child(
                 self.control_choice(selector.clone(), provider.name(), active, on)
                     .debug_selector(move || selector.clone())
+                    .map(|chip| {
+                        #[cfg(all(feature = "integration-test", target_os = "macos"))]
+                        let chip = chip
+                            .relative()
+                            .child(crate::settings_window::native::usage_services::probe(id));
+                        chip
+                    })
                     .when(on, |chip| {
                         chip.on_click(cx.listener(move |this, _, _, cx| {
                             this.save_preference(Preference::UsageProviders(edit), cx);
@@ -33,10 +101,9 @@ impl SettingsWindow {
                     }),
             );
         }
-        let total = usage::providers().count();
         self.control_card("Usage services")
             .child(self.control_note(
-                "Choose which services to read plan usage for, such as only Claude. A service that is off is never contacted and its sign-in is not read; one that is on still appears only when it is signed in.",
+                "Choose which installed or detected services appear in the status bar. A service that is off is never contacted and its sign-in is not read. Services appear here when a supported CLI or sign-in file is found, or usage or a sign-in permission request is detected, on the selected host. Finding a file does not validate the sign-in.",
             ))
             .child(
                 div()
@@ -47,14 +114,14 @@ impl SettingsWindow {
                     .child(self.bulk_choice(
                         "settings-usage-providers-all",
                         "Turn all on",
-                        ProviderEdit::EnableAll,
+                        ProviderEdit::EnableMany(selected),
                         on && enabled < total,
                         cx,
                     ))
                     .child(self.bulk_choice(
                         "settings-usage-providers-none",
                         "Turn all off",
-                        ProviderEdit::DisableAll,
+                        ProviderEdit::DisableMany(selected),
                         on && enabled > 0,
                         cx,
                     ))
@@ -64,13 +131,20 @@ impl SettingsWindow {
                     ),
             )
             .child(chips)
+            .when(total == 0, |card| {
+                card.child(
+                    self.control_note(
+                        "No installed or detected usage services on this host yet. Install a supported CLI, or sign in and refresh Usage to see the service here.",
+                    )
+                    .debug_selector(|| "settings-usage-providers-empty".into()),
+                )
+            })
             .when(!on, |card| {
                 card.child(self.control_note("Turn Usage on above to choose services."))
             })
     }
 
-    /// A button that changes every service at once; idle when it would change
-    /// nothing.
+    /// Changes only the installed or detected services displayed in this card.
     fn bulk_choice(
         &self,
         id: &'static str,

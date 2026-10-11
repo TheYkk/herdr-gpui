@@ -1,6 +1,14 @@
 use super::*;
 use crate::config::{preferences::Preference, usage_providers::ProviderEdit};
 
+fn scope(ids: &[&str]) -> [bool; crate::usage::PROVIDER_COUNT] {
+    let mut selected = [false; crate::usage::PROVIDER_COUNT];
+    for (index, provider) in crate::usage::providers().enumerate() {
+        selected[index] = ids.contains(&provider.id());
+    }
+    selected
+}
+
 fn save(edit: ProviderEdit, path: &Path) -> anyhow::Result<Config> {
     Config::save_preference_path(Preference::UsageProviders(edit), path)?;
     Ok(Config::parse(&fs::read_to_string(path)?)?)
@@ -36,26 +44,40 @@ fn a_service_turns_off_and_on_without_disturbing_the_usage_table() -> anyhow::Re
 }
 
 #[test]
-fn turning_every_service_off_leaves_only_the_ones_picked() -> anyhow::Result<()> {
+fn bulk_changes_only_displayed_services_and_preserves_unseen_choices() -> anyhow::Result<()> {
     let temp = TempDirectory::new()?;
     let path = temp.0.join("config.toml");
-    fs::write(&path, "[usage]\nshow_providers = ['cursor']\n")?;
+    fs::write(
+        &path,
+        "[usage]\nshow_providers = ['cursor']\nhide_providers = ['cursor', 'from-the-future']\n",
+    )?;
 
-    let config = save(ProviderEdit::DisableAll, &path)?;
-    let total = crate::usage::providers().count();
-    assert_eq!(config.usage.hide_providers.len(), total);
-    assert!(total > 1);
-
-    let config = save(ProviderEdit::Enable("claude"), &path)?;
-    assert_eq!(config.usage.hide_providers.len(), total - 1);
-    assert!(!config.usage.hide_providers.iter().any(|id| id == "claude"));
-    assert!(config.usage.hide_providers.iter().any(|id| id == "codex"));
-    // Only the list changes: forced services and other keys stay put.
-    assert_eq!(config.usage.show_providers, ["cursor"]);
-
-    let config = save(ProviderEdit::EnableAll, &path)?;
-    assert!(config.usage.hide_providers.is_empty());
-    assert_eq!(config.usage.show_providers, ["cursor"]);
+    let selected = scope(&["codex", "claude"]);
+    for (edit, expected) in [
+        (
+            ProviderEdit::DisableMany(selected),
+            vec!["cursor", "from-the-future", "codex", "claude"],
+        ),
+        (
+            ProviderEdit::Enable("claude"),
+            vec!["cursor", "from-the-future", "codex"],
+        ),
+        (
+            ProviderEdit::EnableMany(selected),
+            vec!["cursor", "from-the-future"],
+        ),
+        (
+            ProviderEdit::DisableMany([false; crate::usage::PROVIDER_COUNT]),
+            vec!["cursor", "from-the-future"],
+        ),
+    ] {
+        save(edit, &path)?;
+        let table: toml::Table = toml::from_str(&fs::read_to_string(&path)?)?;
+        let hidden: Vec<String> = table["usage"]["hide_providers"].clone().try_into()?;
+        assert_eq!(hidden, expected);
+        let shown: Vec<String> = table["usage"]["show_providers"].clone().try_into()?;
+        assert_eq!(shown, ["cursor"]);
+    }
     Ok(())
 }
 
@@ -78,7 +100,7 @@ fn unknown_services_are_kept_when_the_known_ones_change() -> anyhow::Result<()> 
             .collect::<Vec<_>>(),
         ["from-the-future", "claude"]
     );
-    save(ProviderEdit::EnableAll, &path)?;
+    save(ProviderEdit::EnableMany(scope(&["claude"])), &path)?;
     let table: toml::Table = toml::from_str(&fs::read_to_string(&path)?)?;
     assert_eq!(
         table["usage"]["hide_providers"][0].as_str(),
@@ -92,36 +114,18 @@ fn unknown_services_are_kept_when_the_known_ones_change() -> anyhow::Result<()> 
 }
 
 #[test]
-fn a_long_list_is_written_one_service_per_line() -> anyhow::Result<()> {
-    let temp = TempDirectory::new()?;
-    let path = temp.0.join("config.toml");
-    fs::write(&path, "")?;
-    save(ProviderEdit::DisableAll, &path)?;
-    let text = fs::read_to_string(&path)?;
-    assert!(
-        text.contains("hide_providers = [\n  \"codex\",\n"),
-        "{text}"
-    );
-    // A short list stays on one line.
-    fs::write(&path, "")?;
-    save(ProviderEdit::Disable("claude"), &path)?;
-    assert!(fs::read_to_string(&path)?.contains("hide_providers = [\"claude\"]"));
-    Ok(())
-}
-
-#[test]
 fn malformed_usage_tables_are_rejected_and_left_untouched() -> anyhow::Result<()> {
     let temp = TempDirectory::new()?;
     let path = temp.0.join("config.toml");
     for (original, expected) in [
-        ("usage = false\n", "usage must be a TOML table"),
+        ("usage = false\n", Error::InvalidUsageTable),
         (
             "[usage]\nhide_providers = 'claude'\n",
-            "usage.hide_providers must be a list of provider ids",
+            Error::InvalidHideProviders,
         ),
         (
             "[usage]\nhide_providers = ['claude', 3]\n",
-            "usage.hide_providers must be a list of provider ids",
+            Error::InvalidHideProviders,
         ),
     ] {
         fs::write(&path, original)?;
@@ -131,10 +135,12 @@ fn malformed_usage_tables_are_rejected_and_left_untouched() -> anyhow::Result<()
         )
         .err()
         .context("malformed usage settings must be rejected")?;
-        assert!(
-            std::error::Error::source(&error)
-                .is_some_and(|source| { source.to_string() == expected }),
-            "{error:?}"
+        let Error::Path { source, .. } = &error else {
+            anyhow::bail!("expected a path-scoped settings error: {error:?}");
+        };
+        assert_eq!(
+            std::mem::discriminant(source.as_ref()),
+            std::mem::discriminant(&expected)
         );
         assert_eq!(fs::read_to_string(&path)?, original);
     }

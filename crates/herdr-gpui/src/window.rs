@@ -564,7 +564,7 @@ impl HerdrWindow {
             &self.config.usage,
             &granted,
             self.config_load_revision,
-            self.active,
+            self.active || crate::settings_window::usage_source_active(cx.entity_id(), cx),
             std::time::Instant::now(),
         );
         // A denied prompt takes the grant back, so a later launch does not
@@ -573,6 +573,11 @@ impl HerdrWindow {
             crate::usage::KeychainGrants::revoke(provider, cx);
         }
         changed
+    }
+
+    #[cfg(all(feature = "integration-test", target_os = "macos"))]
+    pub(crate) fn native_update_usage(&mut self, cx: &mut Context<Self>) -> bool {
+        self.update_usage(cx)
     }
 
     /// CPU and memory are sampled for every enabled host, while they are
