@@ -361,3 +361,42 @@ fn notification_command_rejects_ineligible_cards_without_selection_or_requests(
         ));
     }
 }
+
+/// A toast click opens the terminal like a sidebar click does: the keyboard
+/// follows, even when something else held it. A click that is rejected leaves
+/// it alone.
+#[gpui::test]
+fn toast_click_hands_the_keyboard_to_the_terminal(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = cx.add_window_view(crate::sidebar::layout_tests::fixture_window);
+    cx.simulate_resize(size(px(1000.), px(600.)));
+    let (mut remote, _server) = connected_endpoint("ssh:toast");
+    remote.initial_surface = false;
+    let mut wire = crate::notifications::tests::notification("Remote target");
+    wire.workspace_id = Some("w1".into());
+    wire.pane_id = Some("w1:p1".into());
+    let notice = crate::notifications::Notice::new(wire, Instant::now())
+        .with_snapshot(remote.live.snapshot.as_deref())
+        .preview();
+    remote.toasts.receive([notice]);
+    let elsewhere = cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.endpoints[0].detached = true;
+            view.endpoints.push(remote);
+            let elsewhere = cx.focus_handle();
+            window.focus(&elsewhere, cx);
+            elsewhere
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        assert!(elsewhere.is_focused(window));
+        assert!(!view.read(cx).focus.is_focused(window));
+    });
+    let card = cx.debug_bounds("toast-ssh:toast-0").unwrap();
+    cx.simulate_click(card.center(), Default::default());
+    cx.update(|window, cx| {
+        let view = view.read(cx);
+        assert_eq!(view.selected_endpoint, 1);
+        assert!(view.focus.is_focused(window));
+    });
+}

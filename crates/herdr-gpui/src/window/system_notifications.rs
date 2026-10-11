@@ -265,7 +265,9 @@ impl HerdrWindow {
         }) else {
             return;
         };
-        self.open_notice(index, id, cx);
+        if self.open_notice(index, id, cx) {
+            window.focus(&self.focus, cx);
+        }
     }
 }
 
