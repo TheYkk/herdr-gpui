@@ -5,6 +5,7 @@ pub(super) mod plugins;
 mod preferences;
 mod status_bar;
 mod updates;
+mod usage_providers;
 
 use super::{Section, SettingsWindow, remote_history::HostState};
 use crate::{

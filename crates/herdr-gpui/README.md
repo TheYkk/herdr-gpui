@@ -648,6 +648,14 @@ These switches affect GPUI only; they do not change
 the daemon or its plugins. Header text uses GPUI's standard truncation: character boundaries, with trailing
 space or punctuation trimmed before the ellipsis.
 
+**Settings > Status bar > Usage services** turns each AI service on or off
+on its own, so you can read usage for only Claude, or only the subscriptions
+you pay for. **Turn all off** followed by one click on a service is the
+quickest way to keep a single one. The choice is saved as
+`[usage] hide_providers` and applies on config reload. A service that is off
+is never contacted and its sign-in is not read; one that is on still appears
+only when it is signed in, or listed in `show_providers`.
+
 The status bar shows the selected host's CPU and memory: a sparkline of recent
 CPU use and a memory meter, each with its current share, and cores, load
 averages, memory in gigabytes, free space on the volume holding the home

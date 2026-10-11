@@ -23,6 +23,7 @@ pub(crate) mod status_bar;
 mod table;
 mod theme;
 mod updates;
+pub(crate) mod usage_providers;
 pub(crate) mod watch;
 
 pub use coder::CoderConfig;

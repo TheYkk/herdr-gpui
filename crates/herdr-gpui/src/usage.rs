@@ -26,6 +26,8 @@ pub(crate) use access::KeychainGrants;
 pub(crate) use model::{Host, Provider};
 pub(crate) use panel::PANEL_WIDTH;
 pub(crate) use probe::Shell;
+/// Every provider, in the order the status bar lists them.
+pub(crate) use registry::all as providers;
 pub(crate) use render::Hint;
 pub use settings::UsageConfig;
 

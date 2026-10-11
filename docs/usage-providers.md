@@ -33,6 +33,26 @@ when its usage request fails, so a failure does not switch the shown account.
 SSH hosts need `python3` or `jq` to read the JSON sign-in; detection is skipped
 when neither parser is available.
 
+## Choosing which services to read
+
+Every provider is on by default and appears once it finds a sign-in.
+**Settings > Status bar > Usage services** turns each one off or on, and
+**Turn all off** / **Turn all on** change every provider at once; to see only
+Claude, turn all off and then turn Claude on. The choice is saved as
+`[usage] hide_providers` in `config-gpui.local.toml`, which can also be edited
+by hand:
+
+```toml
+[usage]
+hide_providers = ["cursor", "openrouter"]
+```
+
+A provider listed there is skipped before it probes anything: its sign-in is
+not read on this machine or over SSH, no request is made, and it is left out
+of the status bar and panel. Ids from a newer build that this one does not
+know stay in the file. `show_providers` is independent and only adds providers
+that have no sign-in yet.
+
 ## The trait
 
 ```rust
