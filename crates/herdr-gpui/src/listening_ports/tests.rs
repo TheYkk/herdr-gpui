@@ -490,6 +490,41 @@ fn a_tunnel_finished_after_its_port_closed_is_dropped() {
 
 #[cfg(unix)]
 #[test]
+fn a_tunnel_opened_from_an_address_outlives_the_port_listing() {
+    let key = Key {
+        target: "devbox".into(),
+        port: 3000,
+    };
+    let mut tunnels = tunnel::Tunnels::default();
+    tunnels.pin(&key);
+    assert!(tunnels.begin(&key).is_some());
+    // A scan that does not list the port (a server started outside Herdr)
+    // neither cancels the attempt nor closes the tunnel that follows.
+    tunnels.retain(|_| false);
+    let child = idle_child();
+    assert_eq!(
+        tunnels.finish(key.clone(), tunnel::Tunnel::around(child, 41002)),
+        Some(41002)
+    );
+    tunnels.retain(|_| false);
+    assert_eq!(tunnels.local(&key), Some(41002));
+    // An unpinned tunnel to another port still closes with its port.
+    let other = Key {
+        target: "devbox".into(),
+        port: 3001,
+    };
+    assert!(tunnels.begin(&other).is_some());
+    let child = idle_child();
+    let pid = child.id();
+    tunnels.finish(other, tunnel::Tunnel::around(child, 41003));
+    tunnels.retain(|_| false);
+    assert_eq!(tunnels.len(), 1);
+    assert!(gone(pid));
+    tunnels.retain(|_| false);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_dead_tunnel_is_forgotten() {
     let key = Key {
         target: "devbox".into(),

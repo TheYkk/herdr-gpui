@@ -138,10 +138,8 @@ fn hint(port: &Port, link: Option<&Link>) -> String {
 }
 
 impl HerdrWindow {
-    /// Opens a remote loopback-only port through an SSH tunnel: an existing
-    /// one at once, otherwise a new one started on the background executor,
-    /// since SSH may take seconds to connect. The page opens once the tunnel
-    /// accepts; a window closed meanwhile drops, and so kills, the tunnel.
+    /// Opens a remote loopback-only port through an SSH tunnel and shows its
+    /// page in a browser tab of `workspace`.
     pub(crate) fn open_tunneled_page(
         &mut self,
         endpoint: &str,
@@ -150,8 +148,57 @@ impl HerdrWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (endpoint, workspace) = (endpoint.to_owned(), workspace.to_owned());
+        self.with_tunnel(key, window, cx, move |this, local, window, cx| {
+            this.open_local_port(&endpoint, &workspace, local, window, cx);
+        });
+    }
+
+    /// The tunnel an address needs: a loopback address on a workspace whose
+    /// endpoint is an SSH host names that host's own loopback, not this
+    /// machine's. None for every other address and endpoint.
+    pub(crate) fn tunnel_for(&self, url: &WebUrl) -> Option<Key> {
+        let port = url.loopback_port()?;
+        let endpoint = self.endpoints.get(self.selected_endpoint)?;
+        match crate::usage::Host::of(&endpoint.connection.target)? {
+            crate::usage::Host::Ssh(target) => Some(Key { target, port }),
+            crate::usage::Host::Local | crate::usage::Host::Wsl(_) => None,
+        }
+    }
+
+    /// Reaches a loopback address of the focused SSH host: opens a tunnel to
+    /// `key`, kept past the port listing, and calls `then` with `url` moved
+    /// to the tunnel's local end. A failure is shown and `then` is dropped.
+    pub(crate) fn with_tunneled_url(
+        &mut self,
+        key: Key,
+        url: WebUrl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, WebUrl, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        self.tunnels.pin(&key);
+        self.with_tunnel(key, window, cx, move |this, local, window, cx| {
+            match url.at_local_port(local) {
+                Ok(url) => then(this, url, window, cx),
+                Err(error) => this.show_flash(Flash::warning(error.to_string()), cx),
+            }
+        });
+    }
+
+    /// Runs `then` with the local port of a tunnel to `key`: an existing one
+    /// at once, otherwise a new one started on the background executor,
+    /// since SSH may take seconds to connect. `then` runs once the tunnel
+    /// accepts; a window closed meanwhile drops, and so kills, the tunnel.
+    fn with_tunnel(
+        &mut self,
+        key: Key,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, u16, &mut Window, &mut Context<Self>) + 'static,
+    ) {
         if let Some(local) = self.tunnels.local(&key) {
-            self.open_local_port(endpoint, workspace, local, window, cx);
+            then(self, local, window, cx);
             return;
         }
         let Some(preferred) = self.tunnels.begin(&key) else {
@@ -165,13 +212,12 @@ impl HerdrWindow {
         let task = cx
             .background_executor()
             .spawn(async move { tunnel::open(&opening, preferred) });
-        let (endpoint, workspace) = (endpoint.to_owned(), workspace.to_owned());
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(tunnel) => {
                     if let Some(local) = this.tunnels.finish(key, tunnel) {
-                        this.open_local_port(&endpoint, &workspace, local, window, cx);
+                        then(this, local, window, cx);
                     }
                 }
                 Err(error) => {

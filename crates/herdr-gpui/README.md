@@ -693,7 +693,12 @@ noninteractive authentication (keys or an agent). The tunnel stays up while
 the port is listed, is reused by later clicks, and closes when the port
 stops listening, the host disconnects, scanning is turned off, or the window
 closes; a page reopened after a dropped tunnel keeps its address while that
-local port is free. Windows clients
+local port is free. A `localhost`, `127.0.0.1`, or `[::1]` address typed into
+a browser tab's address field, or clicked in a terminal, of a workspace on an SSH
+host means that host's loopback, so it opens through the same kind of tunnel
+(a tab shows `localhost:<local port>`) rather than a server of this machine's on
+that number. Such a tunnel is kept for the window's life, not just while the
+port is listed. Windows clients
 do not scan this machine. Set top-level `show_listening_ports = false`, or
 turn off **Show listening ports** in Settings, to hide them and stop scanning.
 

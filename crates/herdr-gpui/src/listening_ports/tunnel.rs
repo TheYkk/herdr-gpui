@@ -170,6 +170,10 @@ pub(crate) struct Tunnels {
     opening: HashSet<Key>,
     /// The local port each remote port was last forwarded to.
     used: HashMap<Key, u16>,
+    /// Ports opened from an address rather than a listed port. The scan may
+    /// never list them (a server started outside Herdr), so they outlive
+    /// the listing; [`TUNNEL_LIMIT`] bounds how many a window keeps.
+    pinned: HashSet<Key>,
 }
 
 impl Tunnels {
@@ -212,12 +216,22 @@ impl Tunnels {
         self.opening.remove(key);
     }
 
+    /// Keeps `key` open past the listing; call before [`Self::begin`].
+    pub(crate) fn pin(&mut self, key: &Key) {
+        if self.pinned.len() < TUNNEL_LIMIT {
+            self.pinned.insert(key.clone());
+        }
+    }
+
     /// Closes every tunnel whose remote port `listening` no longer lists,
     /// and forgets those still opening, so their result is dropped too.
+    /// Pinned tunnels stay.
     pub(crate) fn retain(&mut self, mut listening: impl FnMut(&Key) -> bool) {
-        self.open.retain(|key, _| listening(key));
-        self.opening.retain(|key| listening(key));
-        self.used.retain(|key, _| listening(key));
+        let pinned = &self.pinned;
+        let mut keep = |key: &Key| pinned.contains(key) || listening(key);
+        self.open.retain(|key, _| keep(key));
+        self.opening.retain(|key| keep(key));
+        self.used.retain(|key, _| keep(key));
     }
 
     #[cfg(all(test, unix))]

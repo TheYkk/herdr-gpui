@@ -592,7 +592,8 @@ impl HerdrWindow {
     /// Listening ports are scanned on the same hosts as CPU and memory.
     fn update_listening_ports(&mut self) -> bool {
         if !self.config.show_listening_ports {
-            self.tunnels = Default::default();
+            // Tunnels opened from an address do not depend on the listing.
+            self.tunnels.retain(|_| false);
             return self.listening_ports.poll(Vec::new());
         }
         let hosts = self.watched_hosts();

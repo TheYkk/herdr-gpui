@@ -494,6 +494,13 @@ impl HerdrWindow {
             self.show_flash(Flash::warning("Not an http or https address"), cx);
             return;
         };
+        // A loopback address names the remote host's own on an SSH workspace.
+        if let Some(key) = self.tunnel_for(&url) {
+            self.with_tunneled_url(key, url, window, cx, move |this, url, window, cx| {
+                this.visit(group, id, Location::Web { url }, window, cx);
+            });
+            return;
+        }
         self.visit(group, id, Location::Web { url }, window, cx);
     }
 

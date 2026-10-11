@@ -450,6 +450,24 @@ impl HerdrWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // `localhost` in a remote terminal is the remote host, so reach it
+        // through an SSH tunnel instead of whatever runs here on that port.
+        if let Some(key) = self.tunnel_for(&url) {
+            self.with_tunneled_url(key, url, window, cx, move |this, url, window, cx| {
+                this.show_web_link(url, in_tab, window, cx);
+            });
+            return;
+        }
+        self.show_web_link(url, in_tab, window, cx);
+    }
+
+    fn show_web_link(
+        &mut self,
+        url: WebUrl,
+        in_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if in_tab && crate::browser::EMBEDDED {
             self.open_browser_tab(Some(url), window, cx);
         } else {

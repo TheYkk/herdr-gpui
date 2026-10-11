@@ -91,6 +91,28 @@ impl WebUrl {
         }
     }
 
+    /// The port of an address that names this machine's own loopback
+    /// (`localhost`, `127.0.0.1`, `[::1]`), or None for any other host. On a
+    /// remote workspace such an address means the remote host's loopback.
+    pub(crate) fn loopback_port(&self) -> Option<u16> {
+        let loopback = match self.0.host()? {
+            url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+            url::Host::Ipv4(address) => address.is_loopback(),
+            url::Host::Ipv6(address) => address.is_loopback(),
+        };
+        loopback.then(|| self.0.port_or_known_default()).flatten()
+    }
+
+    /// The same page reached at `localhost:port`, as an SSH tunnel's local
+    /// end serves it; the scheme, path, query, and fragment are kept.
+    pub(crate) fn at_local_port(&self, port: u16) -> crate::Result<Self> {
+        let mut url = self.0.clone();
+        if url.set_host(Some("localhost")).is_err() || url.set_port(Some(port)).is_err() {
+            return Err(crate::Error::InvalidBrowserUrl);
+        }
+        Self::try_from(url.as_str())
+    }
+
     /// What someone typed into the address field: a bare host such as
     /// `localhost:3000` or `example.com/docs` gets a scheme, local hosts plain
     /// http and everything else https.
@@ -179,6 +201,43 @@ mod tests {
         }
         let long = format!("https://a.test/{}", "x".repeat(MAX_URL_BYTES));
         assert!(WebUrl::try_from(long.as_str()).is_err());
+    }
+
+    #[test]
+    fn loopback_addresses_move_to_a_tunnel_port() {
+        let url = |text| WebUrl::try_from(text).unwrap();
+        for (text, port) in [
+            ("http://localhost:3000/", 3000),
+            ("http://LOCALHOST/", 80),
+            ("https://localhost/x", 443),
+            ("http://127.0.0.1:8000/", 8000),
+            ("http://127.1.2.3:8000/", 8000),
+            ("http://[::1]:5173/", 5173),
+        ] {
+            assert_eq!(url(text).loopback_port(), Some(port), "{text}");
+        }
+        for text in [
+            "http://example.com:3000/",
+            "http://192.168.1.5:3000/",
+            "http://app.localhost:3000/",
+            "http://[::2]:3000/",
+        ] {
+            assert_eq!(url(text).loopback_port(), None, "{text}");
+        }
+        assert_eq!(
+            url("https://[::1]:5173/a/b?c=1#d")
+                .at_local_port(41000)
+                .unwrap()
+                .as_str(),
+            "https://localhost:41000/a/b?c=1#d"
+        );
+        assert_eq!(
+            url("http://127.0.0.1:8000/")
+                .at_local_port(41001)
+                .unwrap()
+                .as_str(),
+            "http://localhost:41001/"
+        );
     }
 
     #[test]
