@@ -16,7 +16,7 @@ fn detected_services_stay_listed_when_disabled(cx: &mut TestAppContext) {
     });
     draw(cx);
     assert!(cx.debug_bounds("settings-usage-provider-claude").is_some());
-    assert!(cx.debug_bounds("settings-usage-provider-cursor").is_none());
+    assert!(cx.debug_bounds("settings-usage-provider-cursor").is_some());
 }
 
 #[gpui::test]

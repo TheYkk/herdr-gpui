@@ -13,13 +13,12 @@ fn mask(id: &str) -> [bool; usage::PROVIDER_COUNT] {
 }
 
 #[gpui::test]
-fn disconnected_host_switch_discovers_disabled_services_without_reopening_settings(
+fn disconnected_host_switch_discovers_services_with_usage_off_without_reopening_settings(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = fixture(cx);
     view.update(cx, |view, _| {
         view.config.usage.show = false;
-        view.config.usage.hide_providers = vec!["codex".into(), "gemini".into()];
     });
     let source = view.read_with(cx, |view, _| view.source.upgrade().unwrap());
     let reply = source.update(cx, |source, cx| {
@@ -75,6 +74,6 @@ fn disconnected_host_switch_discovers_disabled_services_without_reopening_settin
     assert!(cx.debug_bounds("settings-usage-provider-codex").is_none());
     view.read_with(cx, |view, _| {
         assert!(!view.config.usage.show);
-        assert_eq!(view.config.usage.hide_providers, ["codex", "gemini"]);
+        assert!(view.config.usage.hide_providers.is_empty());
     });
 }

@@ -36,7 +36,7 @@ fn selected(ids: &[&str]) -> [bool; usage::PROVIDER_COUNT] {
 }
 
 #[gpui::test]
-fn fresh_disabled_clis_are_visible_and_bulk_enable_only_available_known_services(
+fn fresh_disabled_clis_and_saved_choices_are_visible_and_bulk_enable_only_listed_services(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = fixture(cx);
@@ -63,12 +63,12 @@ fn fresh_disabled_clis_are_visible_and_bulk_enable_only_available_known_services
     });
     assert!(cx.debug_bounds("settings-usage-provider-claude").is_some());
     assert!(cx.debug_bounds("settings-usage-provider-codex").is_some());
-    assert!(cx.debug_bounds("settings-usage-provider-cursor").is_none());
+    assert!(cx.debug_bounds("settings-usage-provider-cursor").is_some());
     assert!(cx.debug_bounds("settings-usage-providers-empty").is_none());
     assert_eq!(
         click(cx, &edits, "settings-usage-providers-all"),
         Some(Preference::UsageProviders(ProviderEdit::EnableMany(
-            selected(&["codex", "claude"])
+            selected(&["codex", "claude", "cursor"])
         )))
     );
 }
@@ -88,13 +88,13 @@ fn installed_disabled_service_can_be_reenabled_individually(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-fn offline_installation_metadata_lists_disabled_codex_missing_from_daemon_path(
+fn offline_installation_metadata_adds_codex_missing_from_daemon_path_and_saved_choices(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = fixture(cx);
     let edits = recording(cx, &view);
     view.update(cx, |view, _| {
-        view.config.usage.hide_providers = vec!["codex".into(), "claude".into()];
+        view.config.usage.hide_providers = vec!["claude".into()];
     });
     metadata(cx, &view, available(true, false));
     draw(cx);
@@ -125,7 +125,7 @@ fn offline_installation_metadata_lists_disabled_codex_missing_from_daemon_path(
     assert!(cx.debug_bounds("settings-usage-provider-claude").is_some());
     assert_eq!(
         click(cx, &edits, "settings-usage-provider-codex"),
-        Some(Preference::UsageProviders(ProviderEdit::Enable("codex")))
+        Some(Preference::UsageProviders(ProviderEdit::Disable("codex")))
     );
 }
 

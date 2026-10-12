@@ -5,9 +5,11 @@ use crate::settings_window::controls::{preferences::PreferenceIo, tests::skill_l
 use gpui::VisualTestContext;
 use std::sync::{Arc, mpsc};
 
+mod busy;
 mod detected;
 mod disconnected;
 mod installed;
+mod saved;
 
 fn fixture(cx: &mut TestAppContext) -> (Entity<SettingsWindow>, &mut VisualTestContext) {
     let source = cx.add_window(crate::sidebar::layout_tests::fixture_window);

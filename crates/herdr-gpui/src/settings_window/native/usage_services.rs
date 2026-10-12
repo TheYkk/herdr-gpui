@@ -2,6 +2,8 @@
 use super::*;
 use std::collections::HashMap;
 
+mod saved;
+
 #[derive(Default)]
 struct ProviderBounds(HashMap<&'static str, Bounds<Pixels>>);
 impl Global for ProviderBounds {}
@@ -70,6 +72,7 @@ pub(super) async fn verify(
             .timer(Duration::from_millis(10))
             .await;
     }
+    saved::verify(settings, source, cx).await?;
     let scroll =
         AnyWindowHandle::from(settings).update(cx, |root, window, cx| -> Result<_> {
             window.draw(cx).clear(cx);

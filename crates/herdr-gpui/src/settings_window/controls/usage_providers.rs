@@ -56,6 +56,10 @@ impl SettingsWindow {
                 }
             }
         }
+        for (provider, displayed) in usage::providers().zip(selected.iter_mut()) {
+            *displayed |= source.config.usage.settings(provider).is_some()
+                || source.config.usage.hidden(provider);
+        }
         if selected == self.usage_providers {
             return false;
         }
@@ -66,7 +70,13 @@ impl SettingsWindow {
     pub(super) fn render_usage_provider_controls(&self, cx: &mut Context<Self>) -> Div {
         let config = &self.config.usage;
         let on = config.show;
-        let selected = self.usage_providers;
+        let interactive = on && !self.busy();
+        let mut selected = self.usage_providers;
+        // Saved preferences are app-level evidence, not a validated host sign-in.
+        // Derive these at render time so settings loads need no source notification.
+        for (provider, displayed) in usage::providers().zip(selected.iter_mut()) {
+            *displayed |= config.settings(provider).is_some() || config.hidden(provider);
+        }
         let mut total = 0;
         let mut chips = div().flex().flex_wrap().gap(px(8.));
         let mut enabled = 0;
@@ -85,7 +95,7 @@ impl SettingsWindow {
             };
             let selector = format!("settings-usage-provider-{id}");
             chips = chips.child(
-                self.control_choice(selector.clone(), provider.name(), active, on)
+                self.control_choice(selector.clone(), provider.name(), active, interactive)
                     .debug_selector(move || selector.clone())
                     .map(|chip| {
                         #[cfg(all(feature = "integration-test", target_os = "macos"))]
@@ -94,7 +104,7 @@ impl SettingsWindow {
                             .child(crate::settings_window::native::usage_services::probe(id));
                         chip
                     })
-                    .when(on, |chip| {
+                    .when(interactive, |chip| {
                         chip.on_click(cx.listener(move |this, _, _, cx| {
                             this.save_preference(Preference::UsageProviders(edit), cx);
                         }))
@@ -103,7 +113,7 @@ impl SettingsWindow {
         }
         self.control_card("Usage services")
             .child(self.control_note(
-                "Choose which installed or detected services appear in the status bar. A service that is off is never contacted and its sign-in is not read. Services appear here when a supported CLI or sign-in file is found, or usage or a sign-in permission request is detected, on the selected host. Finding a file does not validate the sign-in.",
+                "Choose which installed, detected, or saved services appear in the status bar. A service that is off is never contacted and its sign-in is not read. Services appear here from saved provider settings or off preferences, or when a supported CLI or sign-in file is found, or usage or a sign-in permission request is detected, on the selected host. Saved settings and finding a file do not validate the sign-in.",
             ))
             .child(
                 div()
@@ -115,14 +125,14 @@ impl SettingsWindow {
                         "settings-usage-providers-all",
                         "Turn all on",
                         ProviderEdit::EnableMany(selected),
-                        on && enabled < total,
+                        interactive && enabled < total,
                         cx,
                     ))
                     .child(self.bulk_choice(
                         "settings-usage-providers-none",
                         "Turn all off",
                         ProviderEdit::DisableMany(selected),
-                        on && enabled > 0,
+                        interactive && enabled > 0,
                         cx,
                     ))
                     .child(
@@ -134,7 +144,7 @@ impl SettingsWindow {
             .when(total == 0, |card| {
                 card.child(
                     self.control_note(
-                        "No installed or detected usage services on this host yet. Install a supported CLI, or sign in and refresh Usage to see the service here.",
+                        "No installed, detected, or saved usage services on this host yet. Install a supported CLI, or sign in and refresh Usage to see the service here.",
                     )
                     .debug_selector(|| "settings-usage-providers-empty".into()),
                 )
@@ -144,7 +154,7 @@ impl SettingsWindow {
             })
     }
 
-    /// Changes only the installed or detected services displayed in this card.
+    /// Changes only the installed, detected, or saved services displayed here.
     fn bulk_choice(
         &self,
         id: &'static str,
@@ -153,6 +163,7 @@ impl SettingsWindow {
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let enabled = enabled && !self.busy();
         self.control_choice(id, label, false, enabled)
             .debug_selector(move || id.into())
             .when(enabled, |button| {

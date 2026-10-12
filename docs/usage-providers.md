@@ -39,14 +39,19 @@ when neither parser is available.
 Every provider is on by default. **Settings > Status bar > Usage services**
 lists supported services detected on the selected host from its available
 agent commands, provider-specific sign-in file presence, cached usage, or a
-sign-in permission request. Installation evidence does not validate a sign-in
-or subscription. Detection still runs when Usage or individual services are
-off, so disabled services remain available to re-enable after restarting.
+sign-in permission request. Known services with saved provider settings or an
+explicit `hide_providers` preference also remain selectable, even after a
+restart with no cached report. This includes API-key-only services such as
+OpenRouter. These saved choices apply across hosts and do not claim a valid
+sign-in or subscription. Detection still runs when Usage or individual
+services are off.
 Codex file discovery respects `CODEX_HOME`; Claude respects `CLAUDE_CONFIG_DIR`.
 
 **Turn all off** / **Turn all on** affect only the listed services and leave
-undetected services' preferences unchanged. To see only Claude among the
-detected services, turn all off and then turn Claude on. Cached readings are
+unlisted services' preferences unchanged. Provider and bulk controls are
+visibly disabled while preferences are saving or reloading; wait for them to
+become available before making another change. To see only Claude among the
+listed services, turn all off and then turn Claude on. Cached readings are
 filtered as settings apply. New reads can also start while the Status bar
 settings page is in the foreground; you do not need to close Settings or wait
 for the periodic refresh. If a read is already in progress, the latest settings
@@ -60,6 +65,9 @@ The choice is saved as `[usage] hide_providers` in
 [usage]
 hide_providers = ["cursor", "openrouter"]
 ```
+
+Comments within the existing list, including comments on untouched or unknown
+ids, are preserved when services are added or removed.
 
 A provider listed there is skipped before fetching: its credential contents
 are not read on this machine or over SSH, no provider request is made, and it
