@@ -3,15 +3,6 @@ use crate::{endpoint::Endpoint, state::ConnectionStatus};
 use core::prelude::v1::test;
 use herdr_client::ConnectTarget;
 
-fn mask(id: &str) -> [bool; usage::PROVIDER_COUNT] {
-    let mut mask = [false; usage::PROVIDER_COUNT];
-    let index = usage::providers()
-        .position(|provider| provider.id() == id)
-        .unwrap();
-    mask[index] = true;
-    mask
-}
-
 #[gpui::test]
 fn disconnected_host_switch_discovers_services_with_usage_off_without_reopening_settings(
     cx: &mut TestAppContext,
@@ -21,13 +12,21 @@ fn disconnected_host_switch_discovers_services_with_usage_off_without_reopening_
         view.config.usage.show = false;
     });
     let source = view.read_with(cx, |view, _| view.source.upgrade().unwrap());
-    let reply = source.update(cx, |source, cx| {
+    let mut reply = source.update(cx, |source, cx| {
         source.config.usage.show = false;
         source.endpoints[0].live.status = ConnectionStatus::Connecting;
         let target = source.endpoints[0].connection.target.clone();
-        let reply = source
-            .usage
-            .installation_discovery_peer_for_test(target, mask("codex"));
+        let mut reply = source.usage.detection_peer_for_test();
+        source.usage.request_detection(&target);
+        reply(&["codex"]);
+        source.usage.poll(
+            None,
+            &source.config.usage,
+            &Default::default(),
+            0,
+            false,
+            std::time::Instant::now(),
+        );
         cx.notify();
         reply
     });
@@ -55,7 +54,7 @@ fn disconnected_host_switch_discovers_services_with_usage_off_without_reopening_
     cx.run_until_parked();
     draw(cx);
     assert!(cx.debug_bounds("settings-usage-provider-codex").is_none());
-    reply(mask("gemini"));
+    reply(&["gemini"]);
     source.update(cx, |source, cx| {
         source.usage.poll(
             None,

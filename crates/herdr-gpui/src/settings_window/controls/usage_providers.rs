@@ -23,7 +23,7 @@ impl SettingsWindow {
                 .is_some_and(|endpoint| {
                     source
                         .usage
-                        .discovery_target_changed(&endpoint.connection.target)
+                        .detection_target_changed(&endpoint.connection.target)
                 })
         };
         if refresh
@@ -36,23 +36,18 @@ impl SettingsWindow {
             source.update(cx, |source, cx| {
                 source.load_integrations(cx);
                 if let Some(endpoint) = source.endpoints.get(source.selected_endpoint) {
-                    source.usage.request_discovery(&endpoint.connection.target);
+                    source.usage.request_detection(&endpoint.connection.target);
                 }
             });
         }
         let source = source.read(cx);
         let mut selected = source.installed_usage_providers();
-        if let Some(endpoint) = source.endpoints.get(source.selected_endpoint) {
-            let target = &endpoint.connection.target;
-            let installed = source.usage.installed_for_target(target);
-            for (displayed, installed) in selected.iter_mut().zip(installed) {
-                *displayed |= installed;
-            }
-            if let Some(entry) = source.usage.for_target(target) {
-                for provider in entry.detected() {
-                    if let Some(index) = usage::providers().position(|known| known == provider) {
-                        selected[index] = true;
-                    }
+        if let Some(endpoint) = source.endpoints.get(source.selected_endpoint)
+            && let Some(entry) = source.usage.for_target(&endpoint.connection.target)
+        {
+            for provider in entry.detected().chain(entry.installed.iter().copied()) {
+                if let Some(index) = usage::providers().position(|known| known == provider) {
+                    selected[index] = true;
                 }
             }
         }

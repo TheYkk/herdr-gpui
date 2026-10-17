@@ -15,6 +15,7 @@ mod antigravity_consent;
 mod browser_cookies;
 #[cfg(unix)]
 mod claude_keychain;
+mod installed;
 mod keychain_access;
 mod labels;
 #[cfg(unix)]

@@ -1,13 +1,13 @@
 //! Plan usage of the AI services signed in on the selected host, for the
 //! status bar and its panel. One worker thread reads one host at a time and
-//! reports each provider as it answers; the UI thread only queues a host and
+//! reports each provider as it answers, or checks only which services have
+//! files there for Settings; the UI thread only queues a host and
 //! takes answers on later ticks. Each host keeps its last answers, so
 //! switching back shows them at once and a failed refresh keeps the numbers it
 //! had, marked stale, rather than blanking them.
 
 mod access;
 mod cookies;
-mod discovery;
 mod icons;
 mod model;
 mod panel;
@@ -40,7 +40,7 @@ pub use settings::UsageConfig;
 
 use cookies::CookieJar;
 use model::Report;
-use probe::{Consent, Exec, Probe};
+use probe::{Consent, Detector, Exec, Probe};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, mpsc},
@@ -103,6 +103,10 @@ pub(crate) struct Entry {
     round: HashSet<Provider>,
     rate_limited: bool,
     config_changed_during_read: bool,
+    /// Services whose files were found by the last installation check,
+    /// which reads no credentials and contacts no service.
+    pub installed: HashSet<Provider>,
+    detect_due: bool,
 }
 
 /// How many providers the status bar has room for; the panel lists all.
@@ -186,6 +190,13 @@ fn urgency(reading: &Reading) -> f32 {
 enum Message {
     Reading(Host, Provider, crate::Result<Report>),
     Done(Host, crate::Result<()>),
+    Installed(Host, crate::Result<HashSet<Provider>>),
+}
+
+/// The worker either reads usage or only checks which services are installed.
+enum Task {
+    Read(Job),
+    Detect(Host),
 }
 
 /// One read of one host.
@@ -197,7 +208,7 @@ struct Job {
 }
 
 struct Worker {
-    requests: mpsc::SyncSender<Job>,
+    requests: mpsc::SyncSender<Task>,
     results: mpsc::Receiver<Message>,
 }
 
@@ -205,9 +216,12 @@ struct Worker {
 pub(crate) struct Usage {
     host: Option<Host>,
     entries: HashMap<Host, Entry>,
-    discovery: discovery::Discovery,
     worker: Option<Worker>,
     busy: Option<Host>,
+    /// An installation check is running; reads wait for it, and it for them.
+    detecting: bool,
+    /// The target Settings last asked to check.
+    detect_target: Option<herdr_client::ConnectTarget>,
     minute: u64,
     revision: Option<u64>,
     /// The provider last picked in the panel, which leads the status bar on
@@ -228,35 +242,24 @@ impl Usage {
     }
 
     pub(crate) fn for_target(&self, target: &herdr_client::ConnectTarget) -> Option<&Entry> {
-        use herdr_client::ConnectTarget;
-        match target {
-            ConnectTarget::Local | ConnectTarget::Session { .. } | ConnectTarget::Socket(_) => {
-                self.entries.get(&Host::Local)
-            }
-            ConnectTarget::Ssh { target, .. } => self.entries.iter().find_map(|(host, entry)| {
-                matches!(host, Host::Ssh(cached) if cached == target).then_some(entry)
-            }),
-            ConnectTarget::Wsl { distro, .. } => self.entries.iter().find_map(|(host, entry)| {
-                matches!(host, Host::Wsl(cached) if cached == distro).then_some(entry)
-            }),
-            #[cfg(feature = "cloud")]
-            ConnectTarget::Cloud { .. } => None,
+        self.entries.get(&Host::of(target)?)
+    }
+
+    /// Checks which services are installed on `target` as soon as the worker
+    /// is free, even while Usage is off: the check reads no credentials.
+    pub(crate) fn request_detection(&mut self, target: &herdr_client::ConnectTarget) {
+        self.detect_target = Some(target.clone());
+        if let Some(host) = Host::of(target) {
+            self.make_room(&host);
+            self.entries.entry(host).or_default().detect_due = true;
         }
+        self.dispatch_detection();
     }
 
-    pub(crate) fn request_discovery(&mut self, target: &herdr_client::ConnectTarget) {
-        self.discovery.request(target);
-    }
-
-    pub(crate) fn discovery_target_changed(&self, target: &herdr_client::ConnectTarget) -> bool {
-        self.discovery.target_changed(target)
-    }
-
-    pub(crate) fn installed_for_target(
-        &self,
-        target: &herdr_client::ConnectTarget,
-    ) -> [bool; PROVIDER_COUNT] {
-        self.discovery.installed(target)
+    pub(crate) fn detection_target_changed(&self, target: &herdr_client::ConnectTarget) -> bool {
+        self.detect_target
+            .as_ref()
+            .is_some_and(|previous| previous != target)
     }
 
     #[cfg(test)]
@@ -329,7 +332,7 @@ impl Usage {
         active: bool,
         now: Instant,
     ) -> bool {
-        let mut changed = self.discovery.poll() | (self.host != host);
+        let mut changed = self.host != host;
         self.host = host;
         if self
             .revision
@@ -350,6 +353,7 @@ impl Usage {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.worker = None;
                     self.busy = None;
+                    self.detecting = false;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
             }
@@ -365,10 +369,41 @@ impl Usage {
                 .current()
                 .is_some_and(|entry| !entry.readings.is_empty());
         }
-        if active && self.busy.is_none() {
+        self.dispatch_detection();
+        if active && self.busy.is_none() && !self.detecting {
             changed |= self.dispatch(config, granted, now);
         }
         changed
+    }
+
+    fn dispatch_detection(&mut self) {
+        if self.busy.is_some() || self.detecting {
+            return;
+        }
+        let Some(host) = self.detect_target.as_ref().and_then(Host::of) else {
+            return;
+        };
+        let Some(entry) = self.entries.get_mut(&host).filter(|entry| entry.detect_due) else {
+            return;
+        };
+        // Taken before sending, so a dead worker is not respawned every poll.
+        entry.detect_due = false;
+        if self.worker.is_none() {
+            self.worker = spawn();
+        }
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        match worker.requests.try_send(Task::Detect(host)) {
+            Ok(()) => self.detecting = true,
+            Err(mpsc::TrySendError::Full(Task::Detect(host))) => {
+                if let Some(entry) = self.entries.get_mut(&host) {
+                    entry.detect_due = true;
+                }
+            }
+            Err(mpsc::TrySendError::Full(_)) => {}
+            Err(mpsc::TrySendError::Disconnected(_)) => self.worker = None,
+        }
     }
 
     fn dispatch(
@@ -401,7 +436,7 @@ impl Usage {
             granted: granted.clone(),
             retry: self.retry.clone(),
         };
-        match worker.requests.try_send(job) {
+        match worker.requests.try_send(Task::Read(job)) {
             Ok(()) => {
                 self.retry.clear();
                 self.begin(host, now);
@@ -417,11 +452,7 @@ impl Usage {
 
     /// Marks `host` as being read, making room for it in the cache.
     fn begin(&mut self, host: Host, now: Instant) {
-        if self.entries.len() >= HOST_LIMIT && !self.entries.contains_key(&host) {
-            let shown = self.host.clone();
-            self.entries
-                .retain(|kept, _| *kept == host || Some(kept) == shown.as_ref());
-        }
+        self.make_room(&host);
         let entry = self.entries.entry(host.clone()).or_default();
         entry.requested = Some(now);
         entry.round.clear();
@@ -430,6 +461,14 @@ impl Usage {
         // Due again only once this read answers.
         entry.due = Some(now + REFRESH);
         self.busy = Some(host);
+    }
+
+    fn make_room(&mut self, host: &Host) {
+        if self.entries.len() >= HOST_LIMIT && !self.entries.contains_key(host) {
+            let shown = self.host.clone();
+            self.entries
+                .retain(|kept, _| kept == host || Some(kept) == shown.as_ref());
+        }
     }
 
     fn apply(&mut self, message: Message, config: &UsageConfig, now: Instant) {
@@ -517,12 +556,27 @@ impl Usage {
                     entry.due = Some(now);
                 }
             }
+            Message::Installed(host, installed) => {
+                self.detecting = false;
+                match installed {
+                    Ok(installed) => {
+                        if let Some(entry) = self.entries.get_mut(&host) {
+                            entry.installed = installed;
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        category = "usage",
+                        %error,
+                        "could not check which usage services are installed"
+                    ),
+                }
+            }
         }
     }
 }
 
 fn spawn() -> Option<Worker> {
-    let (requests, incoming) = mpsc::sync_channel::<Job>(1);
+    let (requests, incoming) = mpsc::sync_channel::<Task>(1);
     let (outgoing, results) = mpsc::sync_channel(256);
     let spawned = thread::Builder::new()
         .name("herdr-usage".into())
@@ -530,7 +584,17 @@ fn spawn() -> Option<Worker> {
             // Browser cookie keys are kept for the worker's life, so a
             // browser asks for Keychain access once.
             let mut cookies = CookieJar::default();
-            for job in incoming {
+            for task in incoming {
+                let job = match task {
+                    Task::Read(job) => job,
+                    Task::Detect(host) => {
+                        let installed = detect(&host);
+                        if outgoing.send(Message::Installed(host, installed)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 for provider in &job.retry {
                     cookies.forgive(*provider);
                 }
@@ -560,6 +624,26 @@ fn spawn() -> Option<Worker> {
     }
 }
 
+fn connect(host: &Host) -> crate::Result<Exec> {
+    match host {
+        Host::Local => Ok(Exec::Local),
+        Host::Ssh(target) => Ok(Exec::Remote(Shell::connect(target)?)),
+        Host::Wsl(_) => Err(crate::Error::WslHostUnsupported),
+    }
+}
+
+fn detect(host: &Host) -> crate::Result<HashSet<Provider>> {
+    Ok(detect_with(&mut connect(host)?))
+}
+
+/// Which services have files on the host, without opening any of them.
+fn detect_with(exec: &mut Exec) -> HashSet<Provider> {
+    let mut detector = Detector::new(exec);
+    registry::all()
+        .filter(|provider| provider.service().installed(&mut detector))
+        .collect()
+}
+
 /// Reads every provider on `host`, reporting each through `report` as it
 /// answers. A provider the config lists but the host has no sign-in for
 /// answers with what to set up, or that it waits on Keychain access.
@@ -570,11 +654,7 @@ fn read(
     cookies: &mut CookieJar,
     mut report: impl FnMut(Provider, crate::Result<Report>) -> bool,
 ) -> crate::Result<()> {
-    let mut exec = match host {
-        Host::Local => Exec::Local,
-        Host::Ssh(target) => Exec::Remote(Shell::connect(target)?),
-        Host::Wsl(_) => return Err(crate::Error::WslHostUnsupported),
-    };
+    let mut exec = connect(host)?;
     for provider in registry::all() {
         if config.hidden(provider) {
             continue;

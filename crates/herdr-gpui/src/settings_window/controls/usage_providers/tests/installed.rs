@@ -105,9 +105,9 @@ fn offline_installation_metadata_adds_codex_missing_from_daemon_path_and_saved_c
             .connection
             .target
             .clone();
-        source
-            .usage
-            .queue_installation_discovery_for_test(target, selected(&["codex"]));
+        let mut reply = source.usage.detection_peer_for_test();
+        source.usage.request_detection(&target);
+        reply(&["codex"]);
         assert!(source.usage.poll(
             None,
             &source.config.usage,

@@ -16,12 +16,22 @@ pub(crate) fn fixture() -> Result<Usage> {
             access: None,
         })
         .collect();
-    let (requests, incoming) = mpsc::sync_channel::<Job>(1);
+    let (requests, incoming) = mpsc::sync_channel::<Task>(1);
     let (outgoing, results) = mpsc::sync_channel(4);
     thread::Builder::new()
         .name("herdr-native-usage-fixture".into())
         .spawn(move || {
-            for job in incoming {
+            for task in incoming {
+                let job = match task {
+                    Task::Read(job) => job,
+                    Task::Detect(host) => {
+                        let installed = Ok(Default::default());
+                        if outgoing.send(Message::Installed(host, installed)).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
                 for provider in providers {
                     if job.config.hidden(provider) {
                         continue;
