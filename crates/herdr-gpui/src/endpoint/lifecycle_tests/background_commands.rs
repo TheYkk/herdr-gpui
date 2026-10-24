@@ -108,12 +108,30 @@ fn switching_devices_holds_commands_until_the_new_surface_is_activated(
 }
 
 #[test]
-fn a_shown_endpoint_reloads_its_config_at_once_and_only_once() {
-    let (mut endpoint, mut server) = connected_endpoint("ssh:shown");
-    let handle = endpoint.connection.handle.clone().unwrap();
+fn a_full_queue_holds_the_reload_without_reporting_a_failure() {
+    let (mut endpoint, _server) = connected_endpoint("ssh:full");
+    // Nothing drains the queue while the connector waits at the gate.
+    let (stream, _peer) = herdr_client::Stream::pair().unwrap();
+    let (_open, gate) = std::sync::mpsc::channel::<()>();
+    let client = herdr_client::connect_with_connector(
+        endpoint.connection.target.clone(),
+        ConnectOptions::default(),
+        true,
+        move |_, _| {
+            let _ = gate.recv();
+            Ok(stream)
+        },
+    )
+    .unwrap();
+    let boot = snapshot().boot_id;
+    while client.handle.set_focus(&boot, true).is_ok() {}
+    assert!(matches!(
+        client.handle.set_focus(&boot, true),
+        Err(herdr_client::Error::Full)
+    ));
+    endpoint.connection.handle = Some(client.handle);
     endpoint.reload_config().unwrap();
-    let reload = endpoint_request(&mut server);
-    assert_eq!(reload["method"], Method::ServerReloadConfig.as_str());
+    assert!(endpoint.config_reload_pending);
     endpoint.flush_config_reload().unwrap();
-    assert_nothing_queued(&handle, &mut server);
+    assert!(endpoint.config_reload_pending, "a later poll retries it");
 }

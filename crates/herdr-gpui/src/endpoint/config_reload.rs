@@ -11,16 +11,15 @@ impl Endpoint {
     /// activation is queued, rather than sent to be refused.
     pub(crate) fn reload_config(&mut self) -> herdr_client::Result<()> {
         self.config_reload_pending = true;
-        match self.flush_config_reload() {
-            // Still held: a later poll sends it once the queue drains.
-            Err(herdr_client::Error::Full) => Ok(()),
-            result => result,
-        }
+        self.flush_config_reload()
     }
 
     /// Sends a held [`Self::reload_config`] once this connection's surface has
     /// been requested. The daemon handles a connection's commands in order, so
     /// the reload reaches it after the activation.
+    ///
+    /// A full queue is not a failure: the reload stays held and a later poll
+    /// sends it once the queue drains, so no error outlives that retry.
     pub(crate) fn flush_config_reload(&mut self) -> herdr_client::Result<()> {
         if !self.config_reload_pending || !self.initial_surface || !self.live.status.is_connected()
         {
@@ -29,16 +28,17 @@ impl Endpoint {
         let (Some(handle), Some(snapshot)) = (&self.connection.handle, &self.live.snapshot) else {
             return Ok(());
         };
-        let result = handle.request(
+        match handle.request(
             &snapshot.boot_id,
             Method::ServerReloadConfig,
             serde_json::json!({}),
-        );
-        // A full queue drains, so retry on a later poll; any other failure
-        // would only repeat on every one.
-        if !matches!(result, Err(herdr_client::Error::Full)) {
-            self.config_reload_pending = false;
+        ) {
+            Err(herdr_client::Error::Full) => Ok(()),
+            // Any other failure would only repeat on every poll.
+            result => {
+                self.config_reload_pending = false;
+                result.map(drop)
+            }
         }
-        result.map(drop)
     }
 }
