@@ -2,7 +2,10 @@
 //! Only the local Tailscale client is asked; peers are never contacted.
 
 use super::{Candidate, Source, valid_host};
-use crate::{Error, Result, menu::devices::setup};
+use crate::{
+    Result,
+    menu::devices::{Error, setup},
+};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -43,6 +46,10 @@ const SSH_SYSTEMS: [&str; 8] = [
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Status {
+    /// `Running` once connected; `Stopped`, `NeedsLogin`, and others leave
+    /// peers listed from before, which cannot be reached.
+    #[serde(default)]
+    backend_state: Option<String>,
     #[serde(default)]
     peer: Option<BTreeMap<String, Peer>>,
 }
@@ -62,10 +69,11 @@ struct Peer {
     addresses: Vec<IpAddr>,
 }
 
-/// The tailnet's online peers, or none when Tailscale is not installed.
+/// The tailnet's online peers, or none when Tailscale is not installed, not
+/// running, or switched off.
 /// Blocks on a process: call it from the background executor.
 pub(super) fn peers() -> Result<Vec<Candidate>> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = crate::login_env::path().unwrap_or_default();
     let Some(executable) = executable(&path, |path| path.is_file()) else {
         return Ok(Vec::new());
     };
@@ -75,14 +83,22 @@ pub(super) fn peers() -> Result<Vec<Candidate>> {
         TIMEOUT,
         OUTPUT_LIMIT,
     ) {
-        Err(Error::DeviceSetupTimeout) => return Err(Error::TailscaleTimeout),
+        Err(crate::Error::Devices(Error::SetupTimeout)) => {
+            return Err(Error::TailscaleTimeout.into());
+        }
         result => result?,
     };
+    // The CLI fails when its daemon is not running, which only means this
+    // source has nothing to suggest. Its message stays out of the log, as
+    // with other device commands.
     if !status.success() {
-        return Err(Error::TailscaleStatus {
-            status,
-            detail: setup::last_line(&stderr),
-        });
+        tracing::info!(
+            category = "device_discovery",
+            %status,
+            stderr_bytes = stderr.len(),
+            "Tailscale is not running"
+        );
+        return Ok(Vec::new());
     }
     parse(&stdout)
 }
@@ -99,6 +115,13 @@ pub(super) fn executable(path: &OsStr, exists: impl Fn(&Path) -> bool) -> Option
 /// serve SSH, by its MagicDNS name. This machine is not a peer.
 pub(super) fn parse(json: &[u8]) -> Result<Vec<Candidate>> {
     let status: Status = serde_json::from_slice(json).map_err(Error::TailscaleJson)?;
+    if status
+        .backend_state
+        .as_deref()
+        .is_some_and(|state| state != "Running")
+    {
+        return Ok(Vec::new());
+    }
     let mut peers: Vec<Candidate> = status
         .peer
         .unwrap_or_default()

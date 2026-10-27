@@ -1,7 +1,7 @@
 ---
 name: gpui-mockup
 description: Explore visual directions for a herdr-gpui UI element as real GPUI code. Write 3–4 variants in one Rust file, show them side by side in a native mockup window in the user's own theme and fonts, capture the window to check your work, and iterate on the picks and notes the user sends back. Use instead of the HTML `mockup` skill when the design is for this app, so the variant the user picks is the code that ships.
-disable-model-invocation: true
+disable-model-invocation: false
 argument-hint: <what to mock up: a row, tab, popup, panel, or screen of herdr-gpui>
 ---
 
@@ -62,7 +62,7 @@ style details.
      variant and `0` shows all. `Esc` leaves a note field.
 
    Where the notes go: in a Herdr pane (`HERDR_PANE_ID` is set) with Herdr
-   GPUI running, Send hands them to Herdr GPUI, which types them into your
+   GPUI running, Send hands them to Herdr UI, which types them into your
    pane as your next prompt once you are idle, the way browser page notes
    arrive. If no agent is detected, the app keeps them for `browser feedback`
    and reports that. If the app cannot accept the send (including an older

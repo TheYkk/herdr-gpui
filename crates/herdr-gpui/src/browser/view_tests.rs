@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use super::{Location, Store, WebUrl, view::scope};
+use super::{Editor, Location, Store, WebUrl, view::scope};
 use crate::{
     HerdrWindow,
     sidebar::layout_tests::{fixture_window, full_draw, snapshot},
@@ -30,9 +30,16 @@ fn window(cx: &mut gpui::TestAppContext) -> (Entity<HerdrWindow>, &mut VisualTes
     })
 }
 
+/// The `toggle_annotate` binding; only builds that show pages can arm it.
+mod annotate_command;
+
 /// Needs a build that shows pages: elsewhere a new tab opens nothing.
 #[cfg(any(target_os = "macos", windows))]
 mod embedded;
+
+/// A page's own icon on its tab; only builds that show pages get one.
+#[cfg(any(target_os = "macos", windows))]
+mod favicon;
 
 /// Editor groups. Blank browser tabs need no native page, so none is
 /// created, and a split alone needs no page at all.
@@ -42,19 +49,32 @@ mod groups;
 #[cfg(any(target_os = "macos", windows))]
 mod notes;
 
+/// Results a local page sends with `herdr.send`, queued as notes. Notes
+/// belong to pages, which Linux builds do not show.
+#[cfg(any(target_os = "macos", windows))]
+mod page_results;
+
 /// Middle-clicking a strip's tab closes it.
 mod middle_click;
 
 /// Pages a control request opens, only in a workspace the window shows.
-#[cfg(unix)]
 mod requests;
 
 /// Notes a control request sends, only to a pane the window shows.
-#[cfg(unix)]
 mod requested_notes;
 
 /// Browser tabs in a group's strip: reordering and growing in.
 mod tab_strip;
+
+/// Next Tab, Previous Tab, and tabs by number step through pages too. Needs
+/// a build that shows pages: elsewhere a new tab opens nothing.
+#[cfg(any(target_os = "macos", windows))]
+mod tab_steps;
+
+/// Move Tab Left and Right move a page among the pages. Needs a build that
+/// shows pages: elsewhere a new tab opens nothing.
+#[cfg(any(target_os = "macos", windows))]
+mod tab_moves;
 
 /// The VS Code tab's server checks. No native page is created, so this
 /// runs on every platform, except the checks only builds that show pages
@@ -63,6 +83,8 @@ mod code;
 
 /// VS Code as a tab of the groups, opened in the group in use.
 mod code_tab;
+mod editors;
+mod px0;
 
 /// A new VS Code server moves the VS Code tabs to it. Only builds that
 /// show pages follow a server at all.
@@ -79,15 +101,24 @@ mod code_folder;
 #[cfg(any(target_os = "macos", windows))]
 mod code_start;
 
-/// Pages step aside under the status bar's tooltips; only builds that show
-/// pages have any.
-#[cfg(any(target_os = "macos", windows))]
+/// Pages hide under the status bar's tooltips where they draw above the
+/// window, which only Windows does.
+#[cfg(windows)]
 mod status_tooltip;
 
-/// Pages step aside for toasts and the file-transfer card, which they
-/// would hide; only builds that show pages have any.
-#[cfg(any(target_os = "macos", windows))]
+/// Pages hide under toasts and the file-transfer card where they draw above
+/// the window, which only Windows does.
+#[cfg(windows)]
 mod overlays;
 
 /// What closing a workspace does to its browser tabs.
 mod workspace_close;
+
+/// The font size keys zoom a browser tab's page. Only builds that show
+/// pages open a browser tab.
+#[cfg(any(target_os = "macos", windows))]
+mod zoom;
+
+/// Terminal padding beside a page; only builds that show pages open one.
+#[cfg(any(target_os = "macos", windows))]
+mod terminal_padding;

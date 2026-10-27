@@ -105,9 +105,9 @@ fn offline_installation_metadata_adds_codex_missing_from_daemon_path_and_saved_c
             .connection
             .target
             .clone();
-        let mut reply = source.usage.detection_peer_for_test();
+        let mut reply = source.usage.detection_peer();
         source.usage.request_detection(&target);
-        reply(&["codex"]);
+        reply(&["codex"]).unwrap();
         assert!(source.usage.poll(
             None,
             &source.config.usage,
@@ -231,9 +231,7 @@ fn retargeting_open_status_bar_tracks_only_the_new_source(cx: &mut TestAppContex
     });
     metadata(cx, &view, available(false, true));
     previous.update(cx, |source, cx| {
-        source
-            .usage
-            .set_current_for_test(usage::Host::Local, cached(&["openai"]));
+        source.usage = usage::Usage::showing(usage::Host::Local, cached(&["openai"]));
         cx.notify();
     });
     cx.run_until_parked();

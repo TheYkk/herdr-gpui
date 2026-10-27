@@ -1,11 +1,11 @@
 //! Delegate provisioning to the installed Herdr CLI. A host that already runs
 //! a compatible Herdr is saved without a terminal; anything that needs SSH or
-//! installation prompts runs in a local workspace, so no remote installer
-//! policy is duplicated here.
-use crate::{Error, Result};
+//! installation prompts runs in this app on a terminal that a local workspace
+//! shows (see `setup_relay`), so no remote installer policy is duplicated here.
+use super::Error;
+use crate::Result;
 use herdr_client::{Destination, HostProbe, SavedHost};
 use std::{
-    collections::BTreeMap,
     io::Read,
     process::{Command, ExitStatus, Stdio},
     sync::Mutex,
@@ -18,44 +18,46 @@ const SAVE_TIMEOUT: Duration = Duration::from_secs(120);
 const SAVE_STDERR_LIMIT: u64 = 8 * 1024;
 /// `machine remove` and `machine rename` edit one local file.
 const REMOVE_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long a claim keeps this process from adding its host again after a
-/// terminal setup starts: that setup can take this long to finish its prompts.
-const CLAIM_TTL: Duration = Duration::from_secs(15 * 60);
+/// How long a terminal setup may run, prompts included, before it is hung up.
+#[cfg(unix)]
+const SETUP_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 /// Hosts that some window of this process is adding. Herdr's `machine add`
 /// neither locks the catalog nor refuses duplicates, so this is what keeps two
 /// windows, or two clicks, from adding the same host at once.
-static CLAIMS: Mutex<Vec<(Destination, String, Instant)>> = Mutex::new(Vec::new());
+static CLAIMS: Mutex<Vec<(Destination, String)>> = Mutex::new(Vec::new());
 
 /// This process is adding one host and session. Dropping it releases the
-/// host, unless `hold` kept it for a terminal setup that is still running.
+/// host: the dialog holds it, then the terminal setup it started, which drops
+/// it when the setup ends, however it ends.
 #[derive(Debug)]
 pub(super) struct Claim {
     destination: Destination,
     session: String,
-    held: bool,
+    /// Whether dropping it releases the host; only a test's stand-in does not.
+    releases: bool,
 }
 
 impl Claim {
-    fn acquire(destination: Destination, session: &str, now: Instant) -> Result<Self> {
+    fn acquire(destination: Destination, session: &str) -> Result<Self> {
         let mut claims = CLAIMS.lock().unwrap_or_else(|error| error.into_inner());
-        claims.retain(|(.., since)| now.duration_since(*since) < CLAIM_TTL);
-        if claims.iter().any(|(claimed, claimed_session, _)| {
-            *claimed == destination && claimed_session == session
-        }) {
+        if claims
+            .iter()
+            .any(|(claimed, claimed_session)| *claimed == destination && claimed_session == session)
+        {
             tracing::warn!(
                 category = "device_claim",
                 claims = claims.len(),
                 "Host is already claimed by this process"
             );
-            return Err(Error::DeviceAdding);
+            return Err(Error::Adding.into());
         }
         tracing::debug!(category = "device_claim", "Host claimed");
-        claims.push((destination.clone(), session.to_owned(), now));
+        claims.push((destination.clone(), session.to_owned()));
         Ok(Self {
             destination,
             session: session.to_owned(),
-            held: false,
+            releases: true,
         })
     }
 
@@ -67,34 +69,34 @@ impl Claim {
             host: host.into(),
             port: 22,
         };
-        Self::acquire(destination, "default", Instant::now()).unwrap_or(Self {
+        Self::acquire(destination, "default").unwrap_or(Self {
             destination: Destination {
                 user: "test".into(),
                 host: host.into(),
                 port: 22,
             },
             session: "default".into(),
-            held: true,
+            releases: false,
         })
     }
 
-    /// Keep the host claimed until `CLAIM_TTL`, because the terminal that runs
-    /// `machine add` outlives this dialog and cannot report when it finishes.
-    pub(super) fn hold(mut self) {
-        tracing::info!(category = "device_claim", "Host held for a terminal setup");
-        self.held = true;
+    /// The user `ssh` logs in as, which the local configuration supplies when
+    /// the target names none.
+    pub(super) fn user(&self) -> &str {
+        &self.destination.user
     }
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        if self.held {
+        if !self.releases {
             return;
         }
         let mut claims = CLAIMS.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = claims.iter().position(|(claimed, session, _)| {
-            *claimed == self.destination && *session == self.session
-        }) {
+        if let Some(index) = claims
+            .iter()
+            .position(|(claimed, session)| *claimed == self.destination && *session == self.session)
+        {
             claims.remove(index);
             tracing::debug!(category = "device_claim", "Host released");
         }
@@ -107,7 +109,7 @@ impl Drop for Claim {
 /// catalog file: call it from the background executor.
 pub(super) fn claim(request: &Request) -> Result<Claim> {
     let destination = herdr_client::resolve_destination(&request.target)?;
-    let claim = Claim::acquire(destination, &request.session, Instant::now())?;
+    let claim = Claim::acquire(destination, &request.session)?;
     ensure_unsaved(request, &claim, &load_catalog()?, resolve)?;
     Ok(claim)
 }
@@ -116,7 +118,7 @@ pub(super) fn claim(request: &Request) -> Result<Claim> {
 /// this process cannot run at the same time. Blocks on `ssh -G`.
 pub(super) fn claim_saved(target: &str, session: &str) -> Result<Claim> {
     let destination = herdr_client::resolve_destination(target)?;
-    Claim::acquire(destination, session, Instant::now())
+    Claim::acquire(destination, session)
 }
 
 /// Forget a saved device with `herdr machine remove`. The CLI only edits the
@@ -129,16 +131,17 @@ pub(super) fn remove(id: &str) -> Result<()> {
 fn remove_with(executable: &std::ffi::OsStr, id: &str) -> Result<()> {
     if !herdr_client::valid_profile_id(id) {
         tracing::warn!(category = "device_remove", "Invalid profile ID");
-        return Err(Error::DeviceSetupInput("This device has no saved profile."));
+        return Err(Error::SetupInput("This device has no saved profile.").into());
     }
     let (status, _, stderr) = run_cli(executable, &["machine", "remove", id], REMOVE_TIMEOUT)?;
     if status.success() {
         return Ok(());
     }
-    Err(Error::DeviceRemove {
+    Err(Error::Remove {
         status,
         detail: last_line(&stderr),
-    })
+    }
+    .into())
 }
 
 /// Rename a saved device with `herdr machine rename`, which edits only the
@@ -149,7 +152,7 @@ pub(super) fn rename(id: &str, label: &str) -> Result<()> {
 
 fn rename_with(executable: &std::ffi::OsStr, id: &str, label: &str) -> Result<()> {
     if !herdr_client::valid_profile_id(id) {
-        return Err(Error::DeviceSetupInput("This device has no saved profile."));
+        return Err(Error::SetupInput("This device has no saved profile.").into());
     }
     // The `=` form keeps a label that starts with `-` from reading as a flag.
     let (status, _, stderr) = run_cli(
@@ -160,10 +163,11 @@ fn rename_with(executable: &std::ffi::OsStr, id: &str, label: &str) -> Result<()
     if status.success() {
         return Ok(());
     }
-    Err(Error::DeviceRename {
+    Err(Error::Rename {
         status,
         detail: last_line(&stderr),
-    })
+    }
+    .into())
 }
 
 /// Check the catalog on disk again, right before a step that saves.
@@ -218,7 +222,7 @@ fn ensure_unsaved(
                 saved_id = host.id,
                 "Host is already saved"
             );
-            Err(Error::DeviceExists(host.label.clone()))
+            Err(Error::Exists(host.label.clone()).into())
         }
         None => Ok(()),
     }
@@ -244,9 +248,10 @@ pub(super) fn device_label(label: &str, target: &str) -> Result<String> {
         label
     };
     if label.is_empty() || label.len() > LABEL_LIMIT || label.chars().any(char::is_control) {
-        return Err(Error::DeviceSetupInput(
+        return Err(Error::SetupInput(
             "Device names are at most 128 bytes, without control characters.",
-        ));
+        )
+        .into());
     }
     Ok(label.to_owned())
 }
@@ -273,9 +278,10 @@ impl Request {
                 .is_some_and(|(user, _)| user.contains(':'))
             || target.chars().any(|c| c.is_whitespace() || c.is_control())
         {
-            return Err(Error::DeviceSetupInput(
+            return Err(Error::SetupInput(
                 "Enter an SSH target such as user@hostname or an SSH alias.",
-            ));
+            )
+            .into());
         }
         let label = device_label(label, target)?;
         let session = if session.is_empty() {
@@ -289,9 +295,9 @@ impl Request {
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
         {
-            return Err(Error::DeviceSetupInput(
+            return Err(Error::SetupInput(
                 "Session names use letters, digits, dots, underscores, or hyphens (at most 64 bytes), excluding '.' and '..'.",
-            ));
+            ).into());
         }
         Ok(Self {
             target: target.into(),
@@ -332,77 +338,157 @@ impl Request {
     }
 }
 
-// The command is typed into a terminal shell.
-// Single-quote each argument so labels/SSH aliases never become shell syntax.
+// The relay's command line is typed into a terminal shell. Single-quote
+// each word so a path never becomes shell syntax.
+#[cfg(unix)]
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Prefix of the workspace variables that carry the GUI's environment to the
-/// setup command.
-const STAGED_PREFIX: &str = "HERDR_GPUI_SETUP_";
+/// The variables that choose where Herdr keeps its device catalog. Every CLI
+/// run for a device gets this process's values, so it edits the same catalog.
+const CATALOG_ROOTS: [&str; 3] = ["HERDR_CONFIG_PATH", "XDG_STATE_HOME", "XDG_CONFIG_HOME"];
 
-/// What a local workspace needs to run setup interactively.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TerminalSetup {
-    /// The line typed into the workspace shell. A shell still in canonical
-    /// mode truncates typed input (1024 bytes on macOS), so it never inlines
-    /// unbounded values such as `PATH`.
-    pub(super) command: String,
-    /// Launch environment for the workspace, which the command expands.
-    pub(super) environment: BTreeMap<String, String>,
+/// The environment of every Herdr CLI run for a device: the user's `PATH`
+/// and agent, not launchd's, since `machine add` and `ssh-copy-id` run the
+/// user's own `ssh`, and the Tailscale CLI finds the Mac app's daemon with
+/// `/usr/sbin/lsof`; and this window's catalog. Blocks the first time the
+/// login environment is read: call it off the UI thread.
+fn cli_environment(command: &mut Command) {
+    crate::login_env::apply(command);
+    for key in CATALOG_ROOTS {
+        match std::env::var_os(key) {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
 }
 
-fn shell_command(
-    executable: &str,
+/// Run by `sh -c` before `machine add` when the user's key is to be
+/// installed first: `$1` is the target, and the rest is the save command.
+#[cfg(unix)]
+const INSTALL_KEY_THEN: &str = "target=$1; shift; ssh-copy-id \"$target\" && exec \"$@\"";
+
+/// What the setup terminal runs, as a child of `app` (this executable): the
+/// session helper, then `machine add`, after `ssh-copy-id` for `install_key`.
+/// Arguments stay separate words; no shell parses the target or label.
+#[cfg(unix)]
+fn setup_command(
+    app: &std::ffi::OsStr,
+    herdr: &std::ffi::OsStr,
     request: &Request,
-    environment: &[(String, String)],
-) -> TerminalSetup {
-    let mut words = vec![quote("env")];
-    // The daemon's shell does not inherit the GUI's environment. Clear
-    // optional overrides and the staging variables before restoring this
-    // window's exact catalog roots.
-    let names = ["HERDR_CONFIG_PATH", "XDG_STATE_HOME", "XDG_CONFIG_HOME"]
-        .map(String::from)
-        .into_iter()
-        .chain(
-            environment
-                .iter()
-                .map(|(key, _)| format!("{STAGED_PREFIX}{key}")),
-        );
-    for name in names {
-        words.extend([quote("-u"), quote(&name)]);
+    install_key: bool,
+) -> Command {
+    let mut command = herdr_client::new_command(app);
+    command.arg(crate::setup_relay::SESSION);
+    if install_key {
+        command.args(["/bin/sh", "-c", INSTALL_KEY_THEN, "sh", request.target()]);
     }
-    // Keys are fixed variable names, so the double quotes only expand the
-    // staged value, which the shell passes on verbatim.
-    words.extend(
-        environment
-            .iter()
-            .map(|(key, _)| format!("\"{key}=${STAGED_PREFIX}{key}\"")),
-    );
-    words.push(quote(executable));
-    words.extend(request.arguments().into_iter().map(quote));
-    TerminalSetup {
-        command: words.join(" "),
-        environment: environment
-            .iter()
-            .map(|(key, value)| (format!("{STAGED_PREFIX}{key}"), value.clone()))
-            .collect(),
+    command.arg(herdr).args(request.arguments());
+    command
+}
+
+/// The pane's end of a terminal setup that this app runs, while it waits.
+#[cfg(unix)]
+pub(super) type Relay = crate::setup_relay::Listening<Claim>;
+
+/// Windows has no terminal setup, so there is never a relay.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(super) enum Relay {}
+
+#[cfg(windows)]
+impl Relay {
+    pub(super) fn keep(&mut self, _: Claim) {
+        match *self {}
     }
+}
+
+/// A setup that needs prompts: this app runs it on a terminal of its own and
+/// a local workspace shows it (see `setup_relay` for why).
+#[derive(Debug)]
+pub(super) struct TerminalSetup {
+    /// The line typed into the workspace shell: a short relay command, well
+    /// under the 1024 bytes a shell in canonical mode accepts on macOS.
+    pub(super) command: String,
+    pub(super) relay: Relay,
 }
 
 /// Runs `machine add` without a terminal, for a host whose probe found a
 /// compatible Herdr: the CLI starts a stopped server itself. Blocks on SSH, so
 /// call it from the background executor. Stdin is closed, so any approval the
 /// CLI would need fails instead of waiting for input nobody can see.
-pub(super) fn save(request: &Request, claim: &Claim) -> Result<()> {
-    save_with(
+pub(super) fn save(request: &Request, claim: &Claim) -> Result<SaveOutcome> {
+    let result = save_with(
         crate::daemon::executable(),
         request,
         claim,
         load_catalog,
         resolve,
+    );
+    finish_save(
+        result,
+        || request.probe(),
+        || {
+            verify_unsaved(request, claim)?;
+            let host = SavedHost {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                label: request.label.clone(),
+                target: request.target.clone(),
+                session: request.session.clone(),
+                enabled: true,
+            };
+            let saved = herdr_client::store_saved_host(false, &host)?;
+            if saved.id != host.id {
+                return Err(Error::Exists(saved.label).into());
+            }
+            Ok(())
+        },
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SaveOutcome {
+    // keep-sorted start
+    ExistingServer,
+    Ready,
+    // keep-sorted end
+}
+
+impl SaveOutcome {
+    pub(super) fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Ready => None,
+            Self::ExistingServer => Some(
+                "Device added with the existing Herdr server. Version or startup differences may affect recovery after SSH disconnects.",
+            ),
+        }
+    }
+}
+
+fn finish_save(
+    result: Result<()>,
+    probe: impl FnOnce() -> Result<HostProbe>,
+    store: impl FnOnce() -> Result<()>,
+) -> Result<SaveOutcome> {
+    match result {
+        Ok(()) => Ok(SaveOutcome::Ready),
+        Err(crate::Error::Devices(Error::ServerRestart)) => {
+            // The CLI's provisioning requirements are stricter than this
+            // client's endpoint protocol. Recheck after its failed attempt:
+            // only a still-running, compatible host can use the local save.
+            if probe()? != HostProbe::Running {
+                return Err(Error::ServerRestart.into());
+            }
+            store()?;
+            tracing::warn!(
+                category = "device_setup",
+                "Device saved with its existing remote server"
+            );
+            Ok(SaveOutcome::ExistingServer)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The catalog is checked right before `machine add` and again after it. A
@@ -421,10 +507,13 @@ fn save_with(
     ensure_unsaved(request, claim, &load()?, resolve)?;
     let (status, stdout, stderr) = run_cli(executable, &request.arguments(), SAVE_TIMEOUT)?;
     if !status.success() {
-        return Err(Error::DeviceSetup {
-            status,
-            detail: last_line(&stderr),
-        });
+        let detail = last_line(&stderr);
+        // Without a terminal to confirm in, the CLI refuses rather than
+        // restart a server whose panes would stop.
+        if detail.contains(RESTART_REFUSAL) {
+            return Err(Error::ServerRestart.into());
+        }
+        return Err(Error::Setup { status, detail }.into());
     }
     // Without the ID the CLI printed, there is no profile known to be ours.
     let Some(id) = saved_id(&stdout) else {
@@ -445,11 +534,14 @@ fn save_with(
                 "Another client saved this host first; removing ours"
             );
             remove_with(executable, &id)?;
-            Err(Error::DeviceExists(first.label.clone()))
+            Err(Error::Exists(first.label.clone()).into())
         }
         _ => Ok(()),
     }
 }
+
+/// How `machine add` ends when the running server must be restarted first.
+const RESTART_REFUSAL: &str = "remote server is not ready for saved machines";
 
 /// The profile ID from `Saved SSH machine <id>. Remote server is ready.`
 fn saved_id(stdout: &[u8]) -> Option<String> {
@@ -472,7 +564,8 @@ fn run_cli(
 /// Runs a program with closed stdin and a deadline, keeping at most `limit`
 /// bytes of each of stdout and stderr. Both pipes are drained so a chatty
 /// program never blocks on a full one. A missed deadline kills the program and
-/// returns `DeviceSetupTimeout`. Blocks: call it from the background executor.
+/// returns `Error::SetupTimeout`. Blocks, also on the first login-environment
+/// lookup: call it from the background executor.
 pub(super) fn run_bounded(
     executable: &std::ffi::OsStr,
     args: &[&str],
@@ -509,7 +602,9 @@ fn run_bounded_untraced(
     timeout: Duration,
     limit: u64,
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-    let mut child = Command::new(executable)
+    let mut command = herdr_client::new_command(executable);
+    cli_environment(&mut command);
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -547,7 +642,7 @@ fn run_bounded_untraced(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(Error::DeviceSetupTimeout);
+            return Err(Error::SetupTimeout.into());
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -569,35 +664,59 @@ pub(super) fn last_line(output: &[u8]) -> String {
         .collect()
 }
 
-/// The shell command a local workspace runs to set the host up interactively.
-pub(super) fn terminal_command(request: &Request) -> Result<TerminalSetup> {
-    if cfg!(windows) {
-        return Err(Error::DeviceSetupInput(
-            "Saved SSH devices are unavailable on Windows.",
-        ));
-    }
-    let executable = crate::daemon::executable();
-    let executable = executable.to_str().ok_or(Error::DeviceSetupInput(
-        "The Herdr executable path must be UTF-8.",
-    ))?;
-    let mut environment = Vec::new();
-    for key in [
-        "HOME",
-        "PATH",
-        "HERDR_CONFIG_PATH",
-        "XDG_STATE_HOME",
-        "XDG_CONFIG_HOME",
-    ] {
-        if let Some(value) = std::env::var_os(key) {
-            environment.push((
-                key.into(),
-                value
-                    .into_string()
-                    .map_err(|_| Error::DeviceSetupInput("The setup environment must be UTF-8."))?,
-            ));
+#[cfg(all(test, unix))]
+impl TerminalSetup {
+    pub(super) fn fixture(command: &str) -> Self {
+        Self {
+            command: command.into(),
+            relay: Relay::fixture(),
         }
     }
-    Ok(shell_command(executable, request, &environment))
+}
+
+/// Start the setup for a local workspace: this app runs `machine add`, after
+/// `ssh-copy-id` for `install_key`, once the workspace's relay connects. The
+/// relay takes the host's claim and releases it when the setup ends. Blocks on the login environment and
+/// the file system: call it off the UI thread.
+#[cfg(unix)]
+pub(super) fn terminal_setup(request: &Request, install_key: bool) -> Result<TerminalSetup> {
+    let app = std::env::current_exe()?;
+    let dir = crate::preferences::state_dir()
+        .ok_or(Error::SetupInput("Herdr UI has no state directory."))?;
+    let mut command = setup_command(
+        app.as_os_str(),
+        crate::daemon::executable().as_os_str(),
+        request,
+        install_key,
+    );
+    cli_environment(&mut command);
+    let relay = crate::setup_relay::listen(&dir, command, SETUP_LIMIT)?;
+    let command = relay_line(&app, relay.path())?;
+    Ok(TerminalSetup { command, relay })
+}
+
+/// The line the workspace's shell runs: this executable relaying `socket`.
+/// It carries no environment, so its length depends only on the two paths.
+#[cfg(unix)]
+fn relay_line(app: &std::path::Path, socket: &std::path::Path) -> Result<String> {
+    let word = |path: &std::path::Path| {
+        path.to_str()
+            .map(quote)
+            .ok_or(Error::SetupInput("The setup paths must be UTF-8."))
+    };
+    Ok(format!(
+        "{} {} {}",
+        word(app)?,
+        quote(crate::setup_relay::ATTACH),
+        word(socket)?
+    ))
+}
+
+/// Windows has no relay for a terminal setup yet; the dialog asks the user to
+/// run `herdr machine add` in a terminal instead and never calls this.
+#[cfg(windows)]
+pub(super) fn terminal_setup(_: &Request, _: bool) -> Result<TerminalSetup> {
+    Err(Error::SetupInput("Setting up a device in a terminal is unavailable on Windows.").into())
 }
 
 #[cfg(test)]

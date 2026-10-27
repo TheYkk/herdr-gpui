@@ -13,14 +13,18 @@
 //! a replaced connection never opens a tab or types into one.
 
 mod config;
+mod error;
 mod launch;
 mod trust;
 
-pub(crate) use config::{Config, read as read_config};
-pub(crate) use launch::{Checkout, main_checkout};
+pub(crate) use config::{Config, PATH as CONFIG_PATH, read as read_config};
+pub(crate) use error::Error;
+#[cfg(feature = "cloud")]
+pub(crate) use launch::SCRIPT_ENV;
+pub(crate) use launch::{Checkout, command_line, created_tab, main_checkout};
 pub(crate) use trust::{Grant, Trust};
 
-use crate::{HerdrWindow, NavigationTarget, menu::Page, window::Flash};
+use crate::{HerdrWindow, NavigationTarget, menu::Page, state::DialogResponse, window::Flash};
 use gpui::{prelude::*, *};
 use herdr_client::{Method, protocol::ClientPaneInputEvent};
 use std::sync::{
@@ -142,8 +146,8 @@ impl HerdrWindow {
         launch: Launch,
         cx: &mut Context<Self>,
     ) -> crate::Result<()> {
-        if self.worktree_script.is_some() {
-            return Err(crate::Error::WorktreeScriptsBusy);
+        if self.script_slot_busy() {
+            return Err(Error::Busy.into());
         }
         let located = launch.checkout.is_some();
         let step = if located {
@@ -174,8 +178,8 @@ impl HerdrWindow {
         config: Config,
         cx: &mut Context<Self>,
     ) -> crate::Result<()> {
-        if self.worktree_script.is_some() {
-            return Err(crate::Error::WorktreeScriptsBusy);
+        if self.script_slot_busy() {
+            return Err(Error::Busy.into());
         }
         self.worktree_script = Some(Job {
             launch,
@@ -234,7 +238,7 @@ impl HerdrWindow {
             Ok(config) => config.filter(|config| config.scripts.get(kind).is_some()),
             // A setup nobody asked for stays quiet where no file can be read,
             // or every worktree on that host would report it.
-            Err(crate::Error::WorktreeScriptsUnsupportedHost) if !requested => {
+            Err(crate::Error::WorktreeScripts(Error::UnsupportedHost)) if !requested => {
                 self.worktree_script = None;
                 return;
             }
@@ -283,7 +287,7 @@ impl HerdrWindow {
         let kind = job.launch.kind;
         let (Some(script), Some(checkout)) = (config.scripts.get(kind), &job.launch.checkout)
         else {
-            return Err(crate::Error::WorktreeScriptsCheckout);
+            return Err(Error::Checkout.into());
         };
         let request = self.endpoints[self.selected_endpoint]
             .connection
@@ -356,31 +360,13 @@ impl HerdrWindow {
             }
             Some(Step::Reading) | None => return,
         };
-        let Some((id, Some(result))) = &self.live.script_response else {
+        let Some(result) = self.take_script_response(&request) else {
             return;
         };
-        if *id != request {
-            return;
-        }
-        let result = result.clone();
-        self.live.script_response = None;
-        // Not cloned into every later update once read; a newer request's
-        // slot is left alone.
-        if let Ok(mut inbox) = self.endpoints[self.selected_endpoint]
-            .connection
-            .inbox
-            .try_lock()
-            && inbox
-                .script_response
-                .as_ref()
-                .is_some_and(|(id, _)| *id == request)
-        {
-            inbox.script_response = None;
-        }
         let response = match result {
             Ok(response) => response,
             Err(error) => {
-                let error = crate::Error::WorktreeScriptsRequest(error);
+                let error = crate::Error::from(Error::Request(error));
                 return self.fail_worktree_script(error, cx);
             }
         };
@@ -398,32 +384,77 @@ impl HerdrWindow {
             }
             return;
         }
-        let (tab, pane) = match launch::created_tab(&response) {
+        let (tab, pane) = match created_tab(&response) {
             Ok(created) => created,
             Err(error) => return self.fail_worktree_script(error, cx),
         };
-        let line = launch::command_line(job.launch.kind, job.launch.force);
-        let typed = self.endpoints[self.selected_endpoint]
+        let line = command_line(job.launch.kind, job.launch.force);
+        let (boot, endpoint) = (job.launch.boot.clone(), job.launch.endpoint_id.clone());
+        if let Err(error) = self.type_script_line(&boot, &pane, line) {
+            return self.fail_worktree_script(error, cx);
+        }
+        self.worktree_script = None;
+        self.navigate_endpoint(&endpoint, NavigationTarget::Tab(&tab), cx);
+    }
+
+    /// The answer to `request` in the connection's one script slot, once it
+    /// has arrived. Taken, so it is not cloned into every later update; a
+    /// newer request's slot is left alone.
+    pub(crate) fn take_script_response(&mut self, request: &str) -> Option<DialogResponse> {
+        let Some((id, Some(result))) = &self.live.script_response else {
+            return None;
+        };
+        if id != request {
+            return None;
+        }
+        let result = result.clone();
+        self.live.script_response = None;
+        if let Ok(mut inbox) = self.endpoints[self.selected_endpoint]
+            .connection
+            .inbox
+            .try_lock()
+            && inbox
+                .script_response
+                .as_ref()
+                .is_some_and(|(id, _)| id == request)
+        {
+            inbox.script_response = None;
+        }
+        Some(result)
+    }
+
+    /// Type the fixed line that runs a script into the pane its tab made.
+    pub(crate) fn type_script_line(&self, boot: &str, pane: &str, line: &str) -> crate::Result<()> {
+        let handle = self.endpoints[self.selected_endpoint]
             .connection
             .handle
             .as_ref()
-            .ok_or(crate::Error::NotConnected)
-            .and_then(|handle| {
-                Ok(handle.send_input(
-                    &job.launch.boot,
-                    &pane,
-                    [
-                        ClientPaneInputEvent::TextCommit(line.into()),
-                        crate::menu::enter_key(),
-                    ],
-                )?)
-            });
-        if let Err(error) = typed {
-            return self.fail_worktree_script(error, cx);
+            .ok_or(crate::Error::NotConnected)?;
+        Ok(handle.send_input(
+            boot,
+            pane,
+            [
+                ClientPaneInputEvent::TextCommit(line.into()),
+                crate::menu::enter_key(),
+            ],
+        )?)
+    }
+
+    /// Whether a script, of a worktree or a new cloud device, a closed
+    /// agent's tab, or a new chat's tab is starting. The connection keeps
+    /// one script reply slot, so one starts at a time.
+    pub(crate) fn script_slot_busy(&self) -> bool {
+        self.overview_reopening() || self.script_job_busy()
+    }
+
+    /// Whether a worktree or cloud device script, or a new chat, holds the
+    /// script slot.
+    pub(crate) fn script_job_busy(&self) -> bool {
+        #[cfg(feature = "cloud")]
+        if self.cloud_setup.is_some() {
+            return true;
         }
-        let endpoint = job.launch.endpoint_id.clone();
-        self.worktree_script = None;
-        self.navigate_endpoint(&endpoint, NavigationTarget::Tab(&tab), cx);
+        self.worktree_script.is_some() || self.chat_starting()
     }
 
     /// Whether the trust question has been up long enough for a click on it

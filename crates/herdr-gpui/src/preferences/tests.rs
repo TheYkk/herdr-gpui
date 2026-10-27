@@ -1,27 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
+use std::env;
 use std::time::{Duration, Instant};
-
-mod state_directory;
-
-#[core::prelude::v1::test]
-fn font_size_input_accepts_only_whole_values_in_range() {
-    for (input, expected) in [
-        ("8", Some(8.)),
-        ("48", Some(48.)),
-        (" 24 ", Some(24.)),
-        ("7", None),
-        ("49", None),
-        ("14.5", None),
-        ("-8", None),
-        ("+12", None),
-        ("12px", None),
-        ("", None),
-        ("999999", None),
-    ] {
-        assert_eq!(parse_font_size(input), expected, "{input:?}");
-    }
-}
 
 struct TestDirectory(PathBuf);
 
@@ -68,11 +48,14 @@ fn roundtrip_and_reset_drain_after_drop() {
     assert_eq!(await_loaded(&mut preferences), Chrome::default());
     for width in 1..=100 {
         preferences.save(Chrome {
+            activity_panel: None,
+            activity_last_opened: Default::default(),
             sidebar_width: Some(width as f32),
             sidebar_split: Some(0.4),
             agent_sort: Some(AgentSort::Priority),
             notes_width: None,
             review_files_width: None,
+            device_order: Vec::new(),
         });
     }
     let worker = preferences.worker.take().unwrap();
@@ -83,11 +66,14 @@ fn roundtrip_and_reset_drain_after_drop() {
     assert_eq!(
         await_loaded(&mut preferences),
         Chrome {
+            activity_panel: None,
+            activity_last_opened: Default::default(),
             sidebar_width: Some(100.0),
             sidebar_split: Some(0.4),
             agent_sort: Some(AgentSort::Priority),
             notes_width: None,
             review_files_width: None,
+            device_order: Vec::new(),
         }
     );
     preferences.save(Chrome::default());
@@ -105,11 +91,14 @@ fn only_a_toggled_sort_is_stored_and_older_files_migrate() {
     let path = endpoint_path(&directory.0, Path::new("/tmp/sort.sock"));
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let chrome = |agent_sort| Chrome {
+        activity_panel: None,
+        activity_last_opened: Default::default(),
         sidebar_width: Some(240.0),
         sidebar_split: None,
         agent_sort,
         notes_width: None,
         review_files_width: None,
+        device_order: Vec::new(),
     };
     for (json, expected) in [
         // A file from before the sort existed follows the daemon.
@@ -177,22 +166,28 @@ fn drop_does_not_wait_for_blocked_worker_and_queued_saves_still_drain() {
     };
     let queued = [
         Chrome {
+            activity_panel: None,
+            activity_last_opened: Default::default(),
             sidebar_width: Some(160.),
             sidebar_split: None,
             agent_sort: Some(AgentSort::Grouped),
             notes_width: None,
             review_files_width: None,
+            device_order: Vec::new(),
         },
         Chrome {
+            activity_panel: None,
+            activity_last_opened: Default::default(),
             sidebar_width: Some(400.),
             sidebar_split: Some(0.6),
             agent_sort: Some(AgentSort::Priority),
             notes_width: Some(420.),
             review_files_width: None,
+            device_order: Vec::new(),
         },
         Chrome::default(),
     ];
-    for chrome in queued {
+    for chrome in queued.clone() {
         preferences.save(chrome);
     }
     ready.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -240,24 +235,30 @@ fn malformed_and_invalid_widths_fall_back_to_default() {
             write_chrome(
                 &path,
                 Chrome {
+                    activity_panel: None,
+                    activity_last_opened: Default::default(),
                     sidebar_width: Some(width),
                     sidebar_split: None,
                     agent_sort: None,
                     notes_width: None,
                     review_files_width: None,
+                    device_order: Vec::new(),
                 }
             )
             .is_err()
         );
     }
     let chrome = Chrome {
+        activity_panel: None,
+        activity_last_opened: Default::default(),
         sidebar_width: Some(237.5),
         sidebar_split: None,
         agent_sort: None,
         notes_width: None,
         review_files_width: None,
+        device_order: Vec::new(),
     };
-    write_chrome(&path, chrome).unwrap();
+    write_chrome(&path, chrome.clone()).unwrap();
     assert_eq!(read_chrome(&path).unwrap(), chrome);
     assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
 }
@@ -267,11 +268,14 @@ fn invalid_sidebar_splits_preserve_other_preferences() {
     let directory = TestDirectory::new();
     let path = directory.0.join("preferences.json");
     let expected = Chrome {
+        activity_panel: None,
+        activity_last_opened: Default::default(),
         sidebar_width: Some(240.0),
         sidebar_split: None,
         agent_sort: Some(AgentSort::Priority),
         notes_width: None,
         review_files_width: None,
+        device_order: Vec::new(),
     };
     for split in [
         "null", "0", "-1", "0.099", "0.901", "1e100", "1e-100", "\"0.5\"", "true", "[]", "{}",
@@ -297,7 +301,7 @@ fn invalid_sidebar_splits_preserve_other_preferences() {
             &path,
             Chrome {
                 sidebar_split: Some(split),
-                ..expected
+                ..expected.clone()
             },
         )
         .unwrap();
@@ -311,13 +315,16 @@ fn sidebar_split_roundtrips_including_boundaries_and_reset() {
     let path = directory.0.join("preferences.json");
     for sidebar_split in [Some(0.1), Some(0.4), Some(0.9), None] {
         let chrome = Chrome {
+            activity_panel: None,
+            activity_last_opened: Default::default(),
             sidebar_width: Some(240.0),
             sidebar_split,
             agent_sort: Some(AgentSort::Priority),
             notes_width: None,
             review_files_width: None,
+            device_order: Vec::new(),
         };
-        write_chrome(&path, chrome).unwrap();
+        write_chrome(&path, chrome.clone()).unwrap();
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(stored["sidebar_split"], serde_json::json!(sidebar_split));
         assert_eq!(read_chrome(&path).unwrap(), chrome);
@@ -341,4 +348,7 @@ fn endpoint_paths_use_stable_fnv1a() {
     );
 }
 
+mod activity_last_opened;
+mod activity_panel;
+mod device_order;
 mod notes_width;

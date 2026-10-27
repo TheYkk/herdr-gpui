@@ -1,10 +1,13 @@
 # Usage providers
 
-The status bar shows plan usage for every AI service signed in on the
-selected host, and clicking one opens its panel. Each service is a
-*provider*: one module in `crates/herdr-gpui/src/usage/providers/` with a
+The status bar shows as many signed-in AI services as fit on the selected
+host, and clicking one opens its panel. The service selected in the panel
+comes first, followed by those closest to their limits. Narrowing the window
+hides segments that no longer fit; the panel still lists every available
+service. Compact mode leaves room for more services. Each service is a
+*provider*: one module in `crates/herdr-usage/src/providers/` with a
 unit struct implementing `Service`, listed once in
-`crates/herdr-gpui/src/usage/registry.rs`. Providers are ported from
+`crates/herdr-usage/src/registry.rs`. Providers are ported from
 [CodexBar](https://github.com/steipete/CodexBar) (MIT), whose
 `docs/<id>.md` and `Sources/CodexBarCore/Providers/<Name>/` document each
 service's sign-in, endpoints, and response shapes.
@@ -13,6 +16,8 @@ Detection, local and remote fetching, caching, refresh timing, the status
 bar, and the panel all work from the trait. A provider says how to find its
 sign-in, optionally recognize its installation without reading credentials,
 ask its service, and read the answer.
+`herdr-usage` has no GPUI; the app draws the status bar and panel in
+`crates/herdr-gpui/src/usage/`.
 
 ## ChatGPT usage through OpenCode
 
@@ -27,12 +32,31 @@ Use OpenCode's ChatGPT browser or device login; an OpenAI API key does not
 provide ChatGPT subscription limits. OpenCode's own Zen/Go billing is tracked
 by the separate OpenCode providers.
 
-Detection follows the selected host, including SSH hosts. Each usage refresh
+Detection follows the selected host, including SSH hosts and, on Windows, WSL
+distributions. Each usage refresh
 reads the current saved token; OpenCode handles renewing its sign-in. If both
 Codex and OpenCode have OAuth credentials, Codex takes precedence, including
 when its usage request fails, so a failure does not switch the shown account.
-SSH hosts need `python3` or `jq` to read the JSON sign-in; detection is skipped
-when neither parser is available.
+SSH hosts and WSL distributions need `python3` or `jq` to read the JSON
+sign-in; detection is skipped when neither parser is available.
+
+## Grok prepaid balance
+
+Legacy and unified Grok accounts use the same CLI billing endpoint. Herdr
+reads the quota and wallet independently, including when the server omits
+the `isUnifiedBillingUser` flag; account migration is not required.
+
+Grok's CLI billing response can report a prepaid balance without an included
+usage percentage. Herdr shows that balance in USD (the
+[Grok billing contract](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/extensions/billing.rs)
+sends USD cents),
+including zero balances, and the reported period end in the usage panel.
+Included usage stays **Not reported** until the API supplies a percentage or
+the existing on-demand usage ratio; the wallet does not imply a quota or a
+percentage used. The period end does not imply that purchased credits expire.
+When both quota and balance are available, the panel shows both and the status
+bar continues to show quota usage. Sign in with `grok login` on the selected
+host; no additional credentials are needed.
 
 ## Choosing which services to read
 
@@ -80,15 +104,12 @@ adds providers that have no sign-in yet.
 ## The trait
 
 ```rust
-pub(crate) trait Service: Sync {
+pub trait Service: Sync {
     fn meta(&self) -> &'static Meta;
     fn installed(&self, _detector: &mut Detector<'_>) -> bool {
         false
     }
     fn fetch(&self, probe: &mut Probe) -> Option<Result<Report>>;
-    fn render(&self, report: &Report, ui: &Ui, cx: &App) -> AnyElement {
-        ui.standard(report)
-    }
 }
 ```
 
@@ -188,13 +209,15 @@ could select another account's credentials from a shared file.
 | `cookies(&[domain], &[name])` | `Option<Secret>` | The `cookie` setting, else (only for providers the user listed and allowed in the panel) those cookies from Chrome/Safari. Pass the cookie names the service needs; `&[]` takes all cookies of the domains. |
 | `cookies_any(&[domain], &[name])` | `Option<Secret>` | Like `cookies`, satisfied by whichever of the names exists (renamed session cookies). |
 | `cookie_value(&[domain], name)` | `Option<Secret>` | One cookie's bare value, for a service that wants it as a bearer or in a header. |
-| `foreign_keychain(service, account)`, `foreign_keychain_internet(server, account)` | `Option<Secret>` | A keychain item another app owns, such as Zed's sign-in. Reading it makes macOS ask, so it is read only for a listed provider after the user presses Allow in its panel; until then the provider shows a lock in the status bar. A denial is remembered and takes the grant back. |
+| `foreign_keychain(service, account)`, `foreign_keychain_internet(server, account)` | `Option<Secret>` | A keychain item another app owns, such as Zed's sign-in or `muse login`'s. Reading it makes macOS ask, so it is read only for a listed provider after the user presses Allow in its panel; until then the provider shows a lock in the status bar. A denial is remembered and takes the grant back. |
 | `env_text(name)` | `Option<String>` | A host environment variable that is not secret, e.g. a local server URL. |
 | `body(Request)` | `Result<String>` | The body of a successful answer; failures become typed usage errors. Most providers need only this. |
 | `http(Request)` | `Result<Response>` | The whole answer, for a provider that reads the status itself; runs where its secrets are. |
 | `exchange(Request, &[key])` | `Result<Secret>` | A request whose JSON answer holds a new credential (token refresh or exchange); the new credential stays where the request ran. |
 | `command(program, &[arg], timeout)` | `Result<Output>` | Runs a CLI on the host (`~/.local/bin`, Homebrew and similar are on PATH). Its stdout comes back, so only for commands that print no secrets. |
 | `is_remote()`, `is_macos()` | `bool` | Where the probe runs. |
+| `requested()` | `bool` | Whether the provider is listed in `show_providers` rather than only detected. A detected provider must not do anything the user would notice. |
+| `app_data()` | `bool` | Whether the probe may touch another app's own data on this Mac, such as its `~/Library/Application Support` folder, directly or through a command it runs. False for a detected provider on a local Mac, where macOS may ask whether Herdr can access data from other apps; check it before such a read. A listed provider needs no Allow for it, and remote hosts are not gated, since that dialog never reaches the user over SSH. |
 
 `HostPath::home(".codex/auth.json")` is `~/.codex/auth.json` on the host;
 `HostPath::env_or("CODEX_HOME", ".codex", "auth.json")` honors the
@@ -233,7 +256,7 @@ from response text.
 Report::new(Provider(&MyService), Account { email, plan }, windows)
     .with_balances([Balance::new("Credits", 12.5, Unit::Currency("USD".into())).out_of(50.)])
     .with_sections([Section::Facts { title, facts }, Section::Shares { .. }, Section::Limit(window)])
-    .with_detail(MyDetail { .. })   // provider-specific, for its own render
+    .with_detail(MyDetail { .. })   // provider-specific, drawn by the app
 ```
 
 - `Window::new(kind, used_percent, resets_at, length)`. `Kind` is
@@ -251,9 +274,11 @@ Report::new(Provider(&MyService), Account { email, plan }, windows)
 
 ## Rendering
 
-The default `render` draws windows, balances, and sections. A provider with
-richer data stores it with `with_detail` and overrides `render`, reading it
-back with `report.detail::<MyDetail>()` and composing `Ui` pieces:
+The panel draws windows, balances, and sections for every provider. A
+provider with richer data stores it with `with_detail`, makes its type `pub`
+and re-exports it from `herdr_usage::details`, and the app's
+`crates/herdr-gpui/src/usage/details.rs` draws it, reading it back with
+`report.detail::<MyDetail>()` and composing `Ui` pieces:
 `ui.limit(&window)`, `ui.balances(&[..])`, `ui.facts(title, &facts)`,
 `ui.shares(title, &shares)`, `ui.bar(fill, used, None)`, `ui.block()`,
 `ui.heading(..)`, `ui.rule()`, with `ui.theme`, `ui.small()`, `ui.muted()`.

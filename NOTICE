@@ -1,7 +1,7 @@
-Herdr GPUI
+Herdr UI
 Copyright 2026 Fabien Penso
 
-This product includes software developed as part of the Herdr GPUI project,
+This product includes software developed as part of the Herdr UI project,
 licensed under the Apache License, Version 2.0. The full license text is in
 LICENSE at the root of this repository.
 
@@ -46,6 +46,12 @@ assets/social-preview-light-ui.svg, and assets/social-preview-dark.svg, and
 their PNG exports, embed the same adapted ram path alongside original layout,
 typography, and interface artwork.
 
+The built-in theme files in assets/themes/ are unmodified copies from
+iTerm2-Color-Schemes (https://github.com/mbadolato/iTerm2-Color-Schemes),
+Copyright (c) 2011 to Present Mark Badolato, MIT License; each theme's
+copyright belongs to its author. crates/herdr-gpui/THEMES-NOTICE.md has the
+revision and the full license text.
+
 The icons assets/icons/vscode.svg, error.svg, and pass.svg are Codicons,
 Copyright (c) Microsoft Corporation, from
 https://github.com/microsoft/vscode-codicons at revision
@@ -61,14 +67,16 @@ agent-devin.svg, agent-agy.svg (Antigravity), agent-cline.svg,
 agent-mastracode.svg (Mastra), agent-opencode.svg, agent-copilot.svg,
 agent-kimi.svg, agent-kiro.svg, agent-amp.svg, agent-grok.svg,
 agent-hermes.svg (Hermes Agent), agent-kilo.svg (Kilo Code),
-agent-qodercli.svg (Qoder), and agent-qwen.svg are from
+agent-qodercli.svg (Qoder), agent-qwen.svg, and agent-muse.svg (Meta mark)
+are from
 https://github.com/lobehub/lobe-icons/tree/master/packages/static-svg/icons
-(the agents added later at revision 79b551cf26aab9ea4ac701fb807160950a5b860f);
+(the agents added later at revision 79b551cf26aab9ea4ac701fb807160950a5b860f,
+and agent-muse.svg at revision bcdb7c82792a854c2967f7328e11a30205ea584d);
 assets/icons/README.md lists the source file for each.
 SVG wrappers were simplified and dimensions set to 24px; paths are unchanged.
 Brand marks identify their respective products and remain their owners' trademarks.
-The lettermarks agent-omp.svg, agent-droid.svg, agent-letta.svg, agent-maki.svg,
-and agent-muse.svg are original artwork, not those products' logos.
+The lettermarks agent-omp.svg, agent-droid.svg, agent-letta.svg, and
+agent-maki.svg are original artwork, not those products' logos.
 
 MIT License
 

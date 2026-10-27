@@ -46,7 +46,7 @@ pub(crate) async fn run(handle: WindowHandle<HerdrWindow>, cx: &mut AsyncApp) ->
                     == if width < 560. {
                         1
                     } else {
-                        super::super::menus(view.config.layout).len()
+                        super::super::menus(&view.config).len()
                     }
             );
             for button in buttons.iter() {

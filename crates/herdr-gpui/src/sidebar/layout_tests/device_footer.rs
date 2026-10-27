@@ -78,7 +78,10 @@ fn device_footer_filters_both_lists_and_keeps_settings_visible(cx: &mut gpui::Te
     // All Devices -> Local. An explicit-socket fixture must not touch the catalog.
     cx.simulate_keystrokes("down enter");
     cx.update(|window, cx| {
-        assert_eq!(view.read(cx).device_filter.as_deref(), Some("local"));
+        assert_eq!(
+            view.read(cx).device_filter,
+            crate::menu::DeviceScope::only("local")
+        );
         assert!(!view.read(cx).device_visible("ssh:fixture"));
         assert!(view.read(cx).focus.is_focused(window));
         full_draw(window, cx).clear(cx);
@@ -95,24 +98,12 @@ fn device_footer_filters_both_lists_and_keeps_settings_visible(cx: &mut gpui::Te
     cx.update(|window, cx| full_draw(window, cx).clear(cx));
     cx.simulate_keystrokes("enter");
     cx.update(|window, cx| {
-        assert!(view.read(cx).device_filter.is_none());
+        assert!(view.read(cx).device_filter == crate::menu::DeviceScope::All);
         assert_eq!(view.read(cx).selected_endpoint, 0);
         full_draw(window, cx).clear(cx);
     });
     assert!(cx.debug_bounds("host-ssh:fixture").is_some());
     assert!(cx.debug_bounds("device-settings").is_some());
-    // Command routing belongs to settings_window tests; this fixture keeps
-    // testing the legacy modal without starting the personal config loader.
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.open_preferences_fixture(window, cx));
-    });
-    cx.update(|_, cx| {
-        assert_eq!(
-            view.read(cx).menu.page,
-            Some(crate::menu::Page::Preferences)
-        )
-    });
-    cx.simulate_keystrokes("escape");
     // A narrow sidebar retains both controls without spilling into the terminal.
     cx.update(|window, cx| {
         view.update(cx, |view, _| view.sidebar_width = Some(140.));

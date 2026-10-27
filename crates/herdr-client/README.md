@@ -1,7 +1,7 @@
 # Native Client API
 
 Local, SSH, and WSL client for Herdr's stable generation 1 endpoint. Local
-connections work on Unix and on Windows; SSH endpoints are Unix-only, and WSL
+connections and SSH endpoints work on Unix and on Windows, and WSL
 distributions are Windows-only. This crate
 does not link Herdr, GPUI, ratatui, crossterm, Tokio, or a PTY implementation.
 The workspace centralizes the pinned GPUI dependency (`gpui-pre` 0.3.6) for the GUI member.
@@ -35,6 +35,7 @@ while let Ok(event) = client.events.recv() {
 connect(ConnectTarget, ConnectOptions) -> Result<Client>
 connect_with_surface_active(ConnectTarget, ConnectOptions, bool) -> Result<Client>
 load_saved_hosts(development: bool) -> Result<Vec<SavedHost>>
+store_saved_host(development: bool, host: &SavedHost) -> Result<SavedHost>
 load_saved_host_selection(development: bool) -> Result<(Vec<SavedHost>, Option<String>)>
 store_saved_host_selection(development: bool, selected: Option<&str>) -> Result<()>
 SavedHost { pub id: String, pub label: String, pub target: String, pub session: String, pub enabled: bool }
@@ -44,7 +45,7 @@ ConnectTarget::Session { name: String, development: bool }
 ConnectTarget::Socket(PathBuf)
 ConnectTarget::Ssh { target: String, session: String }
 ConnectTarget::socket_path(&self) -> Result<PathBuf>
-Stream  // std::os::unix::net::UnixStream, or a named-pipe wrapper on Windows
+Stream  // std::os::unix::net::UnixStream, or an overlapped named pipe on Windows
 session_socket(config_dir: &Path, name: &str) -> Result<PathBuf>
 list_local_sessions(development: bool) -> Result<Vec<LocalSession>>
 list_remote_sessions(target: &str) -> Result<Vec<RemoteSession>>
@@ -54,6 +55,14 @@ ConnectOptions { surface_size: ClientSurfaceSize, cell_width_px: u32, cell_heigh
 HostTheme { pub foreground: ClientHostColor, pub background: ClientHostColor, pub palette: [ClientHostColor; 256], pub appearance: ClientHostAppearance }
 ```
 
+`store_saved_host` atomically appends a validated profile without connecting to
+or provisioning the remote host. It preserves existing profiles and selection,
+enforces the catalog's count and byte limits, and returns the existing profile
+for an exact target/session duplicate. Callers check connectivity and resolve
+SSH aliases before saving. Calls are serialized within this process; Herdr's
+CLI does not participate in a shared catalog lock. Like the catalog loaders,
+this is blocking worker-only I/O.
+
 Session listing and deletion are blocking worker-only functions. Deletion
 requires explicit user confirmation: it delegates stopping the named session
 and deleting its saved state to the installed CLI. `default` is refused before
@@ -61,8 +70,7 @@ spawning. The client never removes session directories itself. It validates
 names, bounds local stopping to 20 seconds and deletion to 15 seconds (45 seconds
 for the complete SSH operation), discards remote diagnostics, and kills/reaps
 only its CLI or SSH child on failure. A
-timeout is an uncertain result: refresh rather than replay. SSH functions are
-unavailable on Windows. Creating a session is the connection/startup layer's
+timeout is an uncertain result: refresh rather than replay. Creating a session is the connection/startup layer's
 responsibility, not an interactive `session attach` command.
 
 `ClientHandle` is cloneable. Its exact methods are:
@@ -107,6 +115,19 @@ recorded so the next one starts over in full.
 
 `remote_config_value` reads a single Git configuration key on a saved SSH host
 with the same bounded, noninteractive process policy as `remote_origin_url`.
+
+On Unix, one-shot commands on a saved SSH host (`remote_config_value`,
+`run_script` with `ScriptHost::Ssh`, and `shared_script_command`) share a
+master connection per host and `SshLane`: `Quick` for small reads, `Bulk` for
+transfers, so a large upload never queues ahead of a read. `ssh::mux` starts
+each master on first use, under a `/bin/sh` watchdog that ends it when this
+process exits, in an owner-only socket directory. A command waiting for one
+gives up at its own deadline; a full master (8 quick or 2 bulk channels, under
+sshd's default `MaxSessions` of 10), one that failed to start (backing off from
+60 seconds to 30 minutes), or a host with a live master from the user's own
+`ControlPath` all connect directly instead. A bridge reconnecting to a host
+retires its masters, since the network path may have changed. The bridge,
+port forwards, `script_command`, and Windows never share.
 Both are blocking helpers for background workers; absent or empty keys return `None`.
 
 All fallible client APIs return the crate-root `Error`, derived with `thiserror`.
@@ -120,24 +141,48 @@ Errors are not `Clone`, `PartialEq`, or `Eq`; match their typed variants instead
 `connect_with_connector` also returns `Result<Client>`. Its injected connector
 still returns `io::Result<Stream>` because it is an actual I/O interface.
 `Stream` is the crate's local endpoint type, re-exported at the root. It is
-`std::os::unix::net::UnixStream` on Unix. On Windows it wraps an `interprocess`
-named pipe, because that is what the Windows daemon binds: upstream maps the
-same socket path string into the NPFS namespace, so discovery is unchanged.
-Named pipes expose neither a pollable descriptor nor `SO_RCVTIMEO`, so the
-wrapper emulates `set_read_timeout` by peeking the pipe and sleeping briefly
-until data arrives or the deadline passes, keeping the session loop's receive
-deadlines and cancellation identical to the Unix socket. `PIPE_NOWAIT` cannot
-serve here: it reports "no data yet" as `ERROR_NO_DATA`, which the standard
-library maps to `BrokenPipe`, so an idle connection would read as a disconnect.
-The peek is the crate's only `unsafe`, a single `PeekNamedPipe` call with no
-safe wrapper available, matching what the daemon's own Windows client does; no
-extra threads are involved. `set_write_timeout` is accepted and not enforced,
-because a named pipe has no send timeout: a peer that stops reading can block a
-write until it exits. A WSL bridge's stream is the same wrapper around the
-`wsl.exe` child's anonymous stdin and stdout pipes, which `PeekNamedPipe` also
-accepts, with the same limits.
+`std::os::unix::net::UnixStream` on Unix. On Windows it is a named pipe,
+because that is what the Windows daemon binds: upstream maps the same socket
+path string into the NPFS namespace, so discovery is unchanged. `interprocess`
+opens the pipe, overlapped, and the stream takes its handle. A named pipe has
+neither `SO_RCVTIMEO` nor `SO_SNDTIMEO`, so each direction keeps one overlapped
+operation and waits for it only until the caller's deadline:
+
+- A read starts into a 64 KiB buffer the stream owns. At the deadline it reports
+  `TimedOut` and stays in flight, so whatever arrives meanwhile is what the next
+  read returns: no byte is lost and no partial frame restarts.
+- A write copies up to 64 KiB into an operation it starts and reports those
+  bytes written, as a socket's send buffer would. The next write, or a flush,
+  first waits for that operation, again only until its own deadline. One that
+  passes leaves the operation in flight with its bytes, so a call that timed
+  out wrote nothing, and the caller resumes at the same offset. A completion
+  that moved fewer bytes than were reported fails the stream as `WriteZero`.
+- Nothing is cancelled except by dropping the stream, which ends the
+  connection: `CancelIoEx`, then a bounded wait for the kernel to finish with
+  the buffer, on the worker thread. A peer that never reads cannot hold the
+  worker or the drop.
+
+These calls (`transport/overlapped.rs`) are the stream's only `unsafe`, because
+`interprocess` and the standard library block in `WriteFile` and the asynchronous
+wrappers need a runtime or a completion-port reactor. The crate also exports
+`pipe_available`, one `PeekNamedPipe` call, for the app's control pipe, which
+reads a synchronous pipe and has no other bounded way to. An SSH or WSL bridge's
+stream is the same type over two private pipes the crate creates for the child's
+stdin and stdout, overlapped on this end, with the same deadlines; the standard library's
+`Stdio::piped` ends are not documented to be overlapped.
 If adapting a typed error to that callback, use
 `io::Error::new(error.kind(), error)`, not `error.to_string()`, to retain sources.
+
+`private_endpoint` is a local channel only the current user can reach, for
+the user's own programs (the `herdr-acp` chat and the app attached to it): on
+Unix a socket of mode 0600 in a directory of mode 0700, on Windows a named pipe
+created as the first instance with a DACL admitting only the user and refusing
+remote clients. A client checks the pipe's owner is the caller before sending
+anything; `user_sid` and `owner_sid` are those checks, also used by the app's
+control pipe. A connection splits into a reader, a writer, and a closer that
+ends the reader from any thread. Windows reads peek before reading, like the
+control pipe, so a read honours its timeout and a closer can end it; the SID
+lookups are the module's only `unsafe`.
 
 Catalog and selection failures carry `Error::Storage { operation, path, source }`.
 `StorageOperation` distinguishes filesystem, encoding, decoding, and validation
@@ -168,7 +213,7 @@ but does not claim the image lease until `complete(extension, data)`, immediatel
 before encoding. Text/key completion via `complete_input` never claims that lease,
 so text can be reserved and published while an image is active without losing its
 position before subsequent input. A competing image completion returns
-`ClipboardImageBusy` and skips its slot; it does not retry or replay.
+`clipboard::Error::Busy` and skips its slot; it does not retry or replay.
 Both APIs use the same 64-entry command queue (plus one worker-held slot) and
 allocate no payload buffer until completion. Callers must separately bound their
 background acquisition tasks and data (the GUI limits preparation to four tasks).
@@ -185,7 +230,7 @@ ClipboardImageCancellation::is_finished(&self) -> bool
 The upload is an owned, sendable RAII permit, not cloneable. Dropping it skips
 the slot. Only one image lease can be held per connection: the eager image API
 claims it at reservation, the input API only on image completion. Another eager
-image reservation or deferred image completion returns `Error::ClipboardImageBusy`. The atomic
+image reservation or deferred image completion returns `clipboard::Error::Busy`. The atomic
 lease remains held until both preparation and the worker slot are gone, so
 repeated drop/cancel cannot accumulate image slots. The ordinary bounded command
 queue still returns `Full`. A cancellation handle is cloneable and does not
@@ -212,7 +257,7 @@ Completion accepts nonempty opaque bytes up to 16 MiB and case-insensitive
 this is extension/size validation, not image decoding or signature validation.
 Invalid input returns `Error::Protocol` with `ClipboardImageSize`,
 `ClipboardImageExtension`, or `ClipboardImageTarget`. Explicit upload
-cancellation returns `ClipboardImageCancelled`; connection cancellation returns
+cancellation returns `clipboard::Error::Cancelled`; connection cancellation returns
 `Disconnected`. Late completion after a worker rejection fails rather than
 replaying on another connection.
 
@@ -225,14 +270,14 @@ It encodes exactly one event for the captured pane/popup using the ordinary
 2 MiB cap, in the same reserved slot, so
 later input (including Enter) cannot overtake the fallback. It shares completion's
 background-only encoding, GUI identity validation, and cancellation rules.
-`DirectTerminal` returns `ClipboardImageInputTarget`: upstream's legacy `Input`
+`DirectTerminal` returns `clipboard::Error::InputTarget`: upstream's legacy `Input`
 carries raw terminal bytes, and this client cannot infer the direct terminal's
 keyboard or bracketed-paste mode. There is no paste-only completion wrapper.
 
 Preparation has a 60-second deadline from reservation, including encoding.
 `is_cancelled` reflects expiration, and late completion returns
-`ClipboardImageCancelled`. An expired, still-empty slot is cancelled and skipped
-by the worker, with `CommandRejected { reason: ClipboardImagePreparationTimeout,
+`clipboard::Error::Cancelled`. An expired, still-empty slot is cancelled and skipped
+by the worker, with `CommandRejected { reason: clipboard::Error::PreparationTimeout,
 request_id: None }`; ordinary input then resumes without replay. A retained
 expired eager image permit still holds the single-image memory lease until dropped, but no
 longer blocks ordinary commands. Already published data is not subject to the
@@ -246,17 +291,28 @@ Each read turn drains one progressing frame for at most 128 reads (1 MiB) or
 10 ms, stopping immediately on a read without progress. This avoids retrying a
 blocked write before every 8 KiB of a large inbound frame, without starving
 outbound progress or cancellation when a peer sends slowly or stops mid-frame.
-An inbound partial frame fences new outbound commands, but an already-started
-outbound frame continues in bounded chunks to avoid a full-duplex stall. No command
+An inbound partial frame fences state-dependent outbound commands. On Unix,
+explicit input to the latest focused pane can proceed after a complete, bounded
+raw surface identity header matches the authoritative snapshot and a validated
+retained surface. This exception is limited to 4 KiB encoded commands, preserves
+FIFO, and excludes popups, API requests, images, unknown headers, and changed
+boot/projection identities. Already-readable body bytes are drained first;
+strict full-body validation still controls surface publication and disconnection.
+Such input is written in bounded steps, so a peer still sending its frame cannot
+stall the worker: once attempted, it waits as the one held command for room in
+the socket (60-second deadline), reads continue, and once on the wire it
+finishes before any other bytes, including health probes.
+Windows retains the full inbound barrier. An already-started outbound frame
+continues in bounded chunks to avoid a full-duplex stall. No command
 or health frame can interleave with a partial image. Health probes are deferred
 during partial writes; the image has an absolute 60-second write deadline.
 Dropping a pending permit or cancelling before any bytes are written skips the
 slot. Cancellation after a partial write, a write deadline, or a boot change
 closes the connection instead of leaving broken framing or resuming stale data.
 
-Windows returns `ClipboardImageUnsupported` at reservation: its current local
-named-pipe wrapper cannot enforce bounded writes, and remote SSH is already
-unsupported there. Ordinary Windows commands retain their existing behavior.
+Windows follows the same rules over its overlapped pipe, whose send timeout
+behaves as the socket's does: an image write waits at most 10 ms per attempt,
+and a timed-out attempt has written nothing.
 
 `ClientEvent` variants:
 
@@ -294,7 +350,15 @@ not execute escape sequences, read graphics file paths, or mutate the clipboard.
 - One dedicated thread owns connect, handshake, ordered writes, and reads.
 - 64 channel-queued commands plus one worker-held command, 8 ordered events,
   and one in-flight API request. A waiting request holds later commands in FIFO
-  order until the preceding response is complete. Events
+  order until the preceding response is complete. The one exception is a
+  `client_shell.surface.set` queued directly behind `pane.focus`, `tab.focus`, or
+  `workspace.focus`: Herdr applies that focus synchronously and handles surface
+  activation before its busy check, so the activation follows unacknowledged.
+  Its response is delivered after the focus response. If a daemon refuses it as
+  `endpoint_busy`, it is resent once after focus completes and the connection
+  stops pipelining; focus is never resent. No capability promises this
+  ordering, so only stable Herdr 0.9.0 through 0.9.5, whose sources were
+  checked, pipeline it; other versions keep the serialized order. Events
   use backpressure rather than losing snapshots, input, patches, or responses.
 - 2 MiB ordinary outbound payload cap; clipboard images alone allow 16 MiB of
   data plus 2048 bytes of bounded envelope overhead. 32 MiB inbound cap (semantic
@@ -345,10 +409,19 @@ them atomically, then emits a complete immutable `Surface`, not a GUI patch.
 Only surfaces matching the latest snapshot's projection revision are emitted.
 Future surfaces (including subsequent patches) are retained and emitted after
 their matching snapshot arrives.
-When handling a new snapshot, the GUI should invalidate any displayed surface
-whose `(boot_id, projection_revision)` differs from `(boot_id, revision)` and
-wait for matching content. Snapshot metadata and cells must not be mixed across
-focus changes. Full surfaces can skip surface revisions; patches cannot.
+The GUI keeps a matching snapshot/surface pair on screen while staging one newer
+metadata-only snapshot. Input still targets that displayed pane or popup. A
+matching surface commits the new pair and its image catalog together. Changes
+to boot, focus, displayed pane topology, zoom, keybindings or commands invalidate
+the pair immediately; navigation and activation retain their ordered barriers.
+Snapshot metadata and cells are never mixed across revisions. Full surfaces can
+skip surface revisions; patches cannot.
+
+Popup ownership and geometry are carried by surfaces, not snapshot revisions.
+As in the native TUI, an externally opened popup can therefore precede its
+presentation: the daemon silently drops blocked pane input and input for retired
+popup IDs. The GUI never redirects or replays that input into a new target.
+GUI-initiated commands retain the surface barrier before accepting more input.
 
 Herdr sends an image's bytes only in the first surface that places it, so the
 worker, which sees every surface, keeps them: each received surface's
@@ -414,7 +487,7 @@ closes before it is ready without naming an incompatible candidate (that is
 when no Herdr was found) are reduced to an `SshFailure`: `HostKey`, `Auth`,
 `Unreachable`, `HerdrMissing`, or `Other`. The text itself is never retained,
 logged, or exposed, as it may name users, keys, and paths. The class is the
-source of `Error::SshRefused` and travels on `ClientEvent::Disconnected { ssh }`;
+source of `ssh::Error::Refused` and travels on `ClientEvent::Disconnected { ssh }`;
 `SshFailure::needs_user` marks the ones retrying cannot fix. Disconnect reasons
 are sanitized and capped at 1024 characters.
 
@@ -439,17 +512,40 @@ another process took first is never reported. It reports
 every port is refused, or the master does not connect within 30 seconds.
 `stop`, or dropping the handle, kills the master without waiting; the worker
 reaps it and removes its directory. Nothing reconnects. Callers name the remote
-port, so discovery stays elsewhere. Windows returns `Error::SshUnsupported`.
+port, so discovery stays elsewhere. Windows OpenSSH has no control master, so
+there `PortForward::start` returns `ssh::Error::Unsupported`; `forward_command`,
+which holds its forward in its own child, works on Windows too.
 
-Limitations: POSIX remote hosts only, reachable from a Unix client only. The
-bridge hands the `ssh` child a socket pair as its standard streams, which needs
-`OwnedFd`; a Windows client therefore validates the target and session and then
-returns `Error::SshUnsupported` without spawning anything. There is no Windows
-remote discovery, interactive bootstrap/install/upgrade, version-specific mise
-install scanning, or retry/replay.
+On Unix the bridge hands the `ssh` child one end of a socket pair as its
+standard streams. On Windows it gives the child a private pipe each way,
+driven with the same overlapped read and write deadlines as the daemon's named
+pipe, so the handshake, its 16 KiB banner bound, cancellation, and the session
+loop behave the same. `ssh` and `ssh-keygen` are
+OpenSSH for Windows from `%SystemRoot%\System32\OpenSSH`, or without it the
+first absolute `PATH` directory that has them (never Git's MSYS `ssh` ahead of
+the system copy), started without a console window. Every
+command there also passes `ControlPath=none`: Windows OpenSSH cannot share a
+connection, and a configured `ControlPath` fails each one with exit 127, which
+would read as a host without Herdr.
+
+Limitations: there is no interactive bootstrap/install/upgrade,
+version-specific mise install scanning, or retry/replay.
 Shell-initialized PATH entries unavailable to `/bin/sh` are not discovered unless
 covered by the known roots. The remote bridge itself can start the named daemon,
 as upstream does; disconnect only detaches and never stops the remote daemon.
+
+## Background Host Scripts
+
+`run_script(ScriptHost, script, input, output, ScriptLimits, cancelled)` runs a
+POSIX script locally or over a saved SSH target. `run_script_command(Command,
+input, output, ScriptLimits, cancelled)` accepts an already-prepared command for
+provider-specific transports. The caller supplies authentication, quotes the
+remote command, and keeps temporary credential files alive through the call.
+Both are blocking background-worker APIs for Linux, macOS, and Windows, where
+the local host is refused since it has no `/bin/sh`; all have bounded
+streaming output, an idle deadline, cancellation, and owned-child cleanup.
+Provider preparation failures can retain their typed I/O cause in
+`Error::ScriptConnect`; script execution retains the existing script error types.
 
 ## WSL Distributions
 
@@ -459,7 +555,7 @@ WSL distribution. The worker runs `%SystemRoot%\System32\wsl.exe --distribution
 compatibility checks, output-ready marker, and `remote-client-bridge` handshake
 an SSH host uses, over the child's standard streams. `--exec` keeps `wsl.exe`
 from expanding `$VARIABLES` in the script. The child has no console window
-(`CREATE_NO_WINDOW`), starts in the system directory so a vanished WSL share
+(`CREATE_NO_WINDOW`, as for every child built with `new_command`), starts in the system directory so a vanished WSL share
 cannot be its working directory, and has its stderr discarded; the worker kills
 and reaps it on every exit. As over SSH, the bridge starts the session's server
 when it is down, and disconnecting never stops it.
@@ -474,7 +570,7 @@ waiting on a first-run prompt makes `wsl.exe` print nothing and never exit.
 `RemoteHost` names either kind of remote host and dispatches session listing
 and deletion to the right one. Distribution names follow `wsl --import`'s rules
 (`valid_distro`) and are validated before anything spawns. Other platforms
-return `Error::WslUnsupported`.
+return `wsl::Error::Unsupported`.
 
 Saved distributions live in `gpui-wsl.json` beside the endpoint catalog, never
 in upstream's `endpoints.json` or `endpoint-selection.json`, whose strict schemas
@@ -574,6 +670,9 @@ replacement races by that account.
 `Local` checks `HERDR_SOCKET_PATH` (derive `-client.sock` from its file stem),
 then `HERDR_CLIENT_SOCKET_PATH`, then `HERDR_SESSION` (default: `default`).
 Release config lives at `$XDG_CONFIG_HOME/herdr` or `$HOME/.config/herdr`.
+An application launched without `XDG_CONFIG_HOME` can supply its login shell's
+value with `set_login_config_home`; `local_var` reads the environment with that
+fallback, and local discovery uses it.
 An explicit `Session` bypasses socket overrides; `development: true` selects
 `herdr-dev` regardless of this client's compilation profile. Named sessions use
 `sessions/<name>/herdr-client.sock`; `default` uses `herdr-client.sock` directly.

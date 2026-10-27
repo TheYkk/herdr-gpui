@@ -4,6 +4,7 @@ fn hit(target: InputTarget, mouse_reporting: bool) -> WheelTarget {
     WheelTarget {
         target,
         mouse_reporting,
+        stepwise: mouse_reporting,
         bounds: Bounds::default(),
         position: ClientMousePosition::Cell { column: 2, row: 3 },
         geometry: None,
@@ -11,7 +12,7 @@ fn hit(target: InputTarget, mouse_reporting: bool) -> WheelTarget {
 }
 
 fn lines(wheel: &mut WheelAccumulator, target: &WheelTarget, event: &ScrollWheelEvent) -> i16 {
-    wheel.steps(target, event, 10., CELL_HEIGHT).lines
+    wheel.steps(target, event, 10., CELL_HEIGHT, NEUTRAL).lines
 }
 
 #[test]
@@ -59,7 +60,7 @@ fn nonfinite_wheel_deltas_do_not_poison_fractional_motion() {
                         touch_phase: TouchPhase::Moved,
                         ..Default::default()
                     };
-                    let steps = wheel.steps(&pane, &event, 10., CELL_HEIGHT);
+                    let steps = wheel.steps(&pane, &event, 10., CELL_HEIGHT, NEUTRAL);
                     if vertical { steps.lines } else { steps.columns }
                 };
                 // Columns exist only for a mouse-reporting target.
@@ -87,7 +88,7 @@ fn horizontal_wheel_accumulates_columns_by_cell_width_for_mouse_reporting_target
         ..Default::default()
     };
     let mut steps = |target: &WheelTarget, event: &ScrollWheelEvent| {
-        wheel.steps(target, event, 10., CELL_HEIGHT)
+        wheel.steps(target, event, 10., CELL_HEIGHT, NEUTRAL)
     };
     // Pixel motion becomes columns by cell width, keeping the fraction.
     assert_eq!(steps(&pane, &event), WheelSteps::default());
@@ -147,7 +148,7 @@ fn horizontal_wheel_accumulates_columns_by_cell_width_for_mouse_reporting_target
 }
 
 #[test]
-fn wheel_steps_become_one_event_per_axis_vertical_first() {
+fn wheel_steps_become_one_report_per_step_for_an_application_vertical_first() {
     let target = hit(InputTarget::Pane("pane".into()), true);
     let shift = Modifiers {
         shift: true,
@@ -174,14 +175,15 @@ fn wheel_steps_become_one_event_per_axis_vertical_first() {
             .collect::<Vec<_>>()
     };
     assert!(events(0, 0).is_empty());
-    assert_eq!(events(2, 0), [(ClientMouseKind::ScrollUp, 2)]);
-    assert_eq!(events(0, 3), [(ClientMouseKind::ScrollLeft, 3)]);
-    assert_eq!(events(0, -128), [(ClientMouseKind::ScrollRight, 128)]);
+    assert_eq!(events(2, 0), [(ClientMouseKind::ScrollUp, 1); 2]);
+    assert_eq!(events(0, 3), [(ClientMouseKind::ScrollLeft, 1); 3]);
+    assert_eq!(events(0, -128), [(ClientMouseKind::ScrollRight, 1); 128]);
     assert_eq!(
         events(-1, -2),
         [
             (ClientMouseKind::ScrollDown, 1),
-            (ClientMouseKind::ScrollRight, 2)
+            (ClientMouseKind::ScrollRight, 1),
+            (ClientMouseKind::ScrollRight, 1)
         ]
     );
 }
@@ -195,8 +197,8 @@ fn wheel_uses_configured_height_only_for_pixel_deltas() {
         touch_phase: TouchPhase::Moved,
         ..Default::default()
     };
-    assert_eq!(wheel.steps(&pane, &event, 10., 30.).lines, 0);
-    assert_eq!(wheel.steps(&pane, &event, 10., 30.).lines, 1);
+    assert_eq!(wheel.steps(&pane, &event, 10., 30., NEUTRAL).lines, 0);
+    assert_eq!(wheel.steps(&pane, &event, 10., 30., NEUTRAL).lines, 1);
     event.delta = ScrollDelta::Lines(point(0., 2.));
-    assert_eq!(wheel.steps(&pane, &event, 10., 30.).lines, 2);
+    assert_eq!(wheel.steps(&pane, &event, 10., 30., NEUTRAL).lines, 2);
 }

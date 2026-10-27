@@ -1,13 +1,19 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::{
-    Daemon, ListeningPorts, Reading, Scan,
+    Daemon, ListeningPorts, Reading,
     scan::{Bind, Link, MAX_PORTS, Origin, Port, Ports, parse},
     tunnel::{self, Key},
 };
 use crate::{Error, usage::Host};
 use herdr_client::ConnectTarget;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+#[cfg(unix)]
+mod repeated_scans;
+mod ssh_links;
+mod status_bar;
+mod wsl_hosts;
 
 /// The ports one workspace was found with, whichever daemon it named.
 fn of<'a>(ports: &'a Ports, workspace: &str) -> &'a [Port] {
@@ -123,7 +129,10 @@ fn malformed_and_untrusted_lines_are_dropped() {
 
 #[test]
 fn a_host_without_tools_says_so() {
-    assert!(matches!(parse("N\n"), Err(Error::ListeningPortsTool)));
+    assert!(matches!(
+        parse("N\n"),
+        Err(Error::ListeningPorts(super::Error::Tool))
+    ));
     // An idle host answers with nothing at all, which is no ports, not an error.
     assert_eq!(parse("\n").unwrap(), Ports::new());
 }
@@ -143,10 +152,12 @@ fn each_workspace_keeps_its_lowest_ports_only() {
 }
 
 #[test]
-fn urls_reach_the_host_the_port_is_on() {
+fn local_ports_open_where_they_listen() {
     let local = Origin::Local;
-    let remote = Origin::new(&Host::Ssh("me@devbox".into()), None);
-    let url = |port: &Port, origin: &Origin| port.url(origin).map(|url| url.as_str().to_owned());
+    let url = |port: &Port| match port.link(&local) {
+        Some(Link::Page(url)) => Some(url.as_str().to_owned()),
+        _ => None,
+    };
     let any = port(3000, Bind::Any, "node");
     let loopback = port(5173, Bind::Loopback, "vite");
     let lan = port(
@@ -159,40 +170,12 @@ fn urls_reach_the_host_the_port_is_on() {
         Bind::Address(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2))),
         "api",
     );
-    assert_eq!(url(&any, &local).as_deref(), Some("http://localhost:3000/"));
-    assert_eq!(
-        url(&loopback, &local).as_deref(),
-        Some("http://localhost:5173/")
-    );
-    assert_eq!(url(&lan, &local).as_deref(), Some("http://10.0.0.2:8080/"));
-    assert_eq!(url(&v6, &local).as_deref(), Some("http://[fd00::2]:9000/"));
-    // A remote server is opened on its host, never on this machine's localhost.
-    assert_eq!(url(&any, &remote).as_deref(), Some("http://devbox:3000/"));
-    assert_eq!(url(&loopback, &remote), None);
-    assert_eq!(url(&lan, &remote).as_deref(), Some("http://10.0.0.2:8080/"));
-    let ssh =
-        |target: &str, resolved: Option<&str>| Origin::new(&Host::Ssh(target.into()), resolved);
-    assert_eq!(
-        url(&any, &ssh("fd00::9", None)).as_deref(),
-        Some("http://[fd00::9]:3000/")
-    );
-    assert_eq!(url(&any, &ssh("me@", None)), None);
-    // An alias opens at the host name SSH configuration resolves it to.
-    assert_eq!(
-        url(&any, &ssh("me@devbox", Some("devbox.lan"))).as_deref(),
-        Some("http://devbox.lan:3000/")
-    );
-    assert_eq!(
-        url(&any, &ssh("devbox", Some("fd00::7"))).as_deref(),
-        Some("http://[fd00::7]:3000/")
-    );
-    // A resolution no URL can carry falls back to the target's own name.
-    assert_eq!(
-        url(&any, &ssh("me@devbox", Some("a/b"))).as_deref(),
-        Some("http://devbox:3000/")
-    );
-    // Loopback-only remote ports never open on this machine's localhost.
-    assert_eq!(url(&loopback, &ssh("devbox", Some("devbox.lan"))), None);
+    assert_eq!(url(&any).as_deref(), Some("http://localhost:3000/"));
+    assert_eq!(url(&loopback).as_deref(), Some("http://localhost:5173/"));
+    assert_eq!(url(&lan).as_deref(), Some("http://10.0.0.2:8080/"));
+    assert_eq!(url(&v6).as_deref(), Some("http://[fd00::2]:9000/"));
+    // A WSL distribution's ports are this machine's too.
+    assert_eq!(Origin::new(&Host::Wsl("Ubuntu".into())), Origin::Local);
     assert_eq!(any.address(), "*:3000");
     assert_eq!(loopback.address(), "localhost:5173");
 }
@@ -201,22 +184,12 @@ fn urls_reach_the_host_the_port_is_on() {
 fn only_a_different_scan_changes_what_is_shown() {
     let mut reading = Reading::default();
     let found = parse("L 1 *:3000 node\nE 1 w1\n").unwrap();
-    let scan = |ports: &Ports, origin: &Origin| {
-        Ok(Scan {
-            ports: ports.clone(),
-            origin: origin.clone(),
-        })
-    };
-    assert!(reading.apply(scan(&found, &Origin::Local)));
-    assert!(!reading.apply(scan(&found, &Origin::Local)));
-    // Where the ports open is shown too.
-    let remote = Origin::new(&Host::Ssh("devbox".into()), Some("devbox.lan"));
-    assert!(reading.apply(scan(&found, &remote)));
-    assert!(!reading.apply(scan(&found, &remote)));
+    assert!(reading.apply(Ok(found.clone())));
+    assert!(!reading.apply(Ok(found.clone())));
     // A failed scan keeps the last ports and is not a change.
-    assert!(!reading.apply(Err(Error::ListeningPorts(Box::new(
-        Error::UsageUnreachable
-    )))));
+    assert!(!reading.apply(Err(
+        super::Error::Scan(Box::new(herdr_usage::Error::Unreachable.into())).into()
+    )));
     assert_eq!(reading.ports, found);
     let error = reading.error.clone().unwrap();
     assert!(
@@ -224,7 +197,7 @@ fn only_a_different_scan_changes_what_is_shown() {
         "{error}"
     );
     assert!(error.contains("SSH"), "the cause is kept: {error}");
-    assert!(reading.apply(scan(&Ports::new(), &remote)));
+    assert!(reading.apply(Ok(Ports::new())));
     assert_eq!(reading.error, None);
 }
 
@@ -277,7 +250,7 @@ fn this_machine_lists_a_socket_this_process_holds() {
         // Neither ss nor lsof here; parse must say so rather than show nothing.
         assert!(matches!(
             parse(&output.stdout),
-            Err(Error::ListeningPortsTool)
+            Err(Error::ListeningPorts(super::Error::Tool))
         ));
         return;
     }
@@ -363,26 +336,6 @@ fn a_local_daemon_owns_the_api_socket_beside_its_client_socket() {
 }
 
 #[test]
-fn only_remote_loopback_ports_need_a_tunnel() {
-    let loopback = port(5173, Bind::Loopback, "vite");
-    let any = port(3000, Bind::Any, "node");
-    let remote = Origin::new(&Host::Ssh("me@devbox".into()), Some("devbox.lan"));
-    assert_eq!(
-        loopback.link(&remote),
-        Some(Link::Tunnel(Key {
-            target: "me@devbox".into(),
-            port: 5173,
-        }))
-    );
-    assert!(
-        matches!(any.link(&remote), Some(Link::Page(url)) if url.as_str() == "http://devbox.lan:3000/")
-    );
-    assert!(
-        matches!(loopback.link(&Origin::Local), Some(Link::Page(url)) if url.as_str() == "http://localhost:5173/")
-    );
-}
-
-#[test]
 fn a_tunnel_keeps_its_local_port_while_it_is_free() {
     let free = |port: u16| Ok(if port == 0 { 50000 } else { port });
     assert_eq!(tunnel::pick(Some(41000), free).unwrap(), 41000);
@@ -406,9 +359,13 @@ fn a_tunnel_keeps_its_local_port_while_it_is_free() {
 fn a_bad_target_never_starts_ssh() {
     let key = Key {
         target: "-oProxyCommand=bad".into(),
+        address: None,
         port: 3000,
     };
-    assert!(matches!(tunnel::open(&key, None), Err(Error::Client(_))));
+    assert!(matches!(
+        tunnel::open(&key, None, &tunnel::Attempt::default()),
+        Err(Error::Client(_))
+    ));
 }
 
 /// A child that runs until killed, standing in for `ssh -N`.
@@ -447,10 +404,15 @@ fn gone(pid: u32) -> bool {
 fn tunnels_close_with_their_port_and_never_open_twice() {
     let key = Key {
         target: "devbox".into(),
+        address: None,
         port: 5173,
     };
     let mut tunnels = tunnel::Tunnels::default();
-    assert_eq!(tunnels.begin(&key), Some(None));
+    assert_eq!(
+        tunnels.begin(&key),
+        Some(Some(5173)),
+        "the server's own number first"
+    );
     assert_eq!(tunnels.begin(&key), None, "one attempt at a time");
     let child = idle_child();
     let pid = child.id();
@@ -470,9 +432,220 @@ fn tunnels_close_with_their_port_and_never_open_twice() {
 
 #[cfg(unix)]
 #[test]
+fn a_tunnel_can_be_closed_by_hand_and_reopens_on_its_old_port() {
+    let (mine, other) = (
+        Key {
+            target: "devbox".into(),
+            address: None,
+            port: 5173,
+        },
+        Key {
+            target: "devbox".into(),
+            address: None,
+            port: 5174,
+        },
+    );
+    let mut tunnels = tunnel::Tunnels::default();
+    let (child, kept) = (idle_child(), idle_child());
+    let (pid, kept_pid) = (child.id(), kept.id());
+    assert!(tunnels.begin(&mine).is_some());
+    tunnels.finish(mine.clone(), tunnel::Tunnel::around(child, 41005));
+    assert!(tunnels.begin(&other).is_some());
+    tunnels.finish(other.clone(), tunnel::Tunnel::around(kept, 41006));
+    assert!(tunnels.is_open(&mine));
+
+    assert!(tunnels.close(&mine));
+
+    assert!(!tunnels.is_open(&mine));
+    assert!(gone(pid), "the closed tunnel's child outlived it");
+    assert!(tunnels.is_open(&other), "other tunnels stay open");
+    assert!(!gone(kept_pid));
+    assert!(!tunnels.close(&mine), "nothing left to close");
+    assert_eq!(tunnels.begin(&mine), Some(Some(41005)));
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_a_tunnel_still_opening_drops_its_result() {
+    let key = Key {
+        target: "devbox".into(),
+        address: None,
+        port: 8081,
+    };
+    let mut tunnels = tunnel::Tunnels::default();
+    assert!(tunnels.begin(&key).is_some());
+    assert!(tunnels.close(&key));
+    let child = idle_child();
+    let pid = child.id();
+    assert_eq!(
+        tunnels.finish(key.clone(), tunnel::Tunnel::around(child, 41007)),
+        None
+    );
+    assert!(!tunnels.is_open(&key));
+    assert!(gone(pid));
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_all_kills_a_tunnel_that_is_still_connecting() {
+    let key = Key {
+        target: "devbox".into(),
+        address: None,
+        port: 3002,
+    };
+    let mut tunnels = tunnel::Tunnels::default();
+    assert!(tunnels.begin(&key).is_some());
+    // The background task's child, owned by the attempt while connecting.
+    let attempt = tunnels.attempt(&key).unwrap();
+    attempt.adopt(idle_child());
+
+    tunnels.close_all();
+
+    assert!(killed(&attempt), "the connecting child outlived close_all");
+    assert!(
+        !tunnels.fail(&key),
+        "nobody waits for the cancelled attempt"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_a_connecting_port_by_hand_or_when_it_unlists_kills_its_child() {
+    for by_hand in [true, false] {
+        let key = Key {
+            target: "devbox".into(),
+            address: None,
+            port: 3003,
+        };
+        let mut tunnels = tunnel::Tunnels::default();
+        assert!(tunnels.begin(&key).is_some());
+        let attempt = tunnels.attempt(&key).unwrap();
+        attempt.adopt(idle_child());
+
+        if by_hand {
+            assert!(tunnels.close(&key));
+        } else {
+            assert!(!tunnels.retain(|_| false), "no open tunnel went away");
+        }
+
+        assert!(killed(&attempt), "by_hand={by_hand}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_attempt_cancelled_before_its_child_exists_kills_it_on_arrival() {
+    let attempt = tunnel::Attempt::default();
+    attempt.cancel();
+    attempt.adopt(idle_child());
+    assert!(killed(&attempt));
+}
+
+#[cfg(unix)]
+#[test]
+fn quitting_kills_a_finished_tunnel_still_on_its_way_to_the_window() {
+    let key = Key {
+        target: "devbox".into(),
+        address: None,
+        port: 3004,
+    };
+    let mut tunnels = tunnel::Tunnels::default();
+    assert!(tunnels.begin(&key).is_some());
+    let attempt = tunnels.attempt(&key).unwrap();
+    attempt.adopt(idle_child());
+    // SSH reported ready; the result has not reached `finish` yet.
+    let in_flight = tunnel::Tunnel::new(&attempt, 41011);
+
+    tunnels.close_all();
+
+    assert!(
+        killed(&attempt),
+        "the finished tunnel's child outlived quit"
+    );
+    assert_eq!(tunnels.finish(key, in_flight), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn retain_reports_when_a_dead_tunnel_is_pruned() {
+    let key = Key {
+        target: "devbox".into(),
+        address: None,
+        port: 9001,
+    };
+    let mut tunnels = tunnel::Tunnels::default();
+    let mut child = idle_child();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    tunnels.insert(key.clone(), tunnel::Tunnel::around(child, 41008));
+    assert!(tunnels.retain(|_| true), "the redraw must be requested");
+    assert!(!tunnels.is_open(&key));
+    assert!(!tunnels.retain(|_| true), "nothing more changed");
+}
+
+/// Whether the child `attempt` holds was killed, waiting a bounded while.
+/// The attempt only kills it; reaping is its owner's job, so this reaps it
+/// here, which works on every Unix rather than reading `/proc`.
+#[cfg(unix)]
+fn killed(attempt: &tunnel::Attempt) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = attempt.try_wait().unwrap() {
+            // `Child::kill` sends SIGKILL on every Unix.
+            return status.signal() == Some(9);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_all_tunnels_kills_every_child_and_drops_late_results() {
+    let (open, opening) = (
+        Key {
+            target: "devbox".into(),
+            address: None,
+            port: 3000,
+        },
+        Key {
+            target: "devbox".into(),
+            address: None,
+            port: 3001,
+        },
+    );
+    let mut tunnels = tunnel::Tunnels::default();
+    let child = idle_child();
+    let pid = child.id();
+    tunnels.insert(open.clone(), tunnel::Tunnel::around(child, 41003));
+    assert!(tunnels.begin(&opening).is_some());
+
+    tunnels.close_all();
+
+    assert_eq!(tunnels.len(), 0);
+    assert!(gone(pid), "the tunnel's child outlived close_all");
+    // The attempt still in flight finds nobody waiting for it.
+    let late = idle_child();
+    let late_pid = late.id();
+    assert_eq!(
+        tunnels.finish(opening, tunnel::Tunnel::around(late, 41004)),
+        None
+    );
+    assert!(gone(late_pid));
+    assert_eq!(
+        tunnels.begin(&open),
+        Some(Some(3000)),
+        "no stale local port kept"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_tunnel_finished_after_its_port_closed_is_dropped() {
     let key = Key {
         target: "devbox".into(),
+        address: None,
         port: 8080,
     };
     let mut tunnels = tunnel::Tunnels::default();
@@ -493,6 +666,7 @@ fn a_tunnel_finished_after_its_port_closed_is_dropped() {
 fn a_dead_tunnel_is_forgotten() {
     let key = Key {
         target: "devbox".into(),
+        address: None,
         port: 9000,
     };
     let mut tunnels = tunnel::Tunnels::default();
@@ -528,10 +702,13 @@ fn another_process_on_the_port_is_never_taken_for_the_tunnel() {
     let _port = squatter.local_addr().unwrap().port();
     let (mut child, stdout) = scripted("exec sleep 600");
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
-    let result = tunnel::ready(&mut child, stdout, deadline);
+    let result = tunnel::ready(|| child.try_wait(), stdout, deadline);
     child.kill().unwrap();
     child.wait().unwrap();
-    assert!(matches!(result, Err(Error::TunnelTimeout)), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::Tunnel(tunnel::Error::Timeout))),
+        "{result:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -540,7 +717,7 @@ fn a_tunnel_is_ready_once_ssh_prints_its_line() {
     let (mut child, stdout) =
         scripted("echo 'shell noise'; echo herdr-forward-ready; exec sleep 600");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let result = tunnel::ready(&mut child, stdout, deadline);
+    let result = tunnel::ready(|| child.try_wait(), stdout, deadline);
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(result.is_ok(), "{result:?}");
@@ -552,8 +729,8 @@ fn ssh_ending_before_its_forward_is_bound_reports_why() {
     // ExitOnForwardFailure: a taken port ends SSH before LocalCommand runs.
     let (mut child, stdout) = scripted("echo 'bind failed' >&2; exit 255");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    match tunnel::ready(&mut child, stdout, deadline) {
-        Err(Error::TunnelExited(status)) => assert_eq!(status.code(), Some(255)),
+    match tunnel::ready(|| child.try_wait(), stdout, deadline) {
+        Err(Error::Tunnel(tunnel::Error::Exited(status))) => assert_eq!(status.code(), Some(255)),
         other => panic!("expected the exit status, got {other:?}"),
     }
 }
@@ -563,10 +740,12 @@ fn ssh_ending_before_its_forward_is_bound_reports_why() {
 fn a_local_port_is_never_handed_back_to_a_previous_remote_port() {
     let first = Key {
         target: "devbox".into(),
+        address: None,
         port: 3000,
     };
     let second = Key {
         target: "devbox".into(),
+        address: None,
         port: 4000,
     };
     let mut tunnels = tunnel::Tunnels::default();
@@ -591,6 +770,6 @@ fn a_local_port_is_never_handed_back_to_a_previous_remote_port() {
         Some(41000)
     );
     // Reopening the first must not prefer the port now showing the second.
-    assert_eq!(tunnels.begin(&first), Some(None));
+    assert_eq!(tunnels.begin(&first), Some(Some(3000)));
     tunnels.retain(|_| false);
 }

@@ -19,7 +19,7 @@ use crate::{
     config::{FontConfig, LayoutMode, Theme},
     icons::AgentIcon,
 };
-use gpui::{App, ClickEvent, Div, ElementId, Window};
+use gpui::{App, ClickEvent, Div, ElementId, ParentElement, Styled, Window};
 use herdr_client::protocol::{AgentStatus, ClientShellWorkspace};
 use std::borrow::Cow;
 
@@ -40,6 +40,16 @@ pub(super) struct RowContext<'a> {
     /// The host these rows live on, named only while several hosts are
     /// listed and this one is remote, so a single-host sidebar stays quiet.
     pub(super) host: Option<&'a str>,
+}
+
+impl RowContext<'_> {
+    /// The indicators for a status mark in one of these rows: faded with
+    /// the row's own fade and the host's dimming, which a mark drawn in the
+    /// window's mark layer does not inherit.
+    pub(super) fn status_indicators(&self) -> super::agents::Indicators {
+        self.indicators
+            .faded(self.indicators.fade() * self.mark.opacity())
+    }
 }
 
 /// A click listener, erased so rows of every group share one type.
@@ -103,6 +113,9 @@ pub(super) struct AgentRow<'a> {
     /// Its workspace and, when that earns a place, its tab. Missing once the
     /// workspace has gone.
     pub(super) place: Option<(&'a str, Option<&'a str>)>,
+    /// Its pane's name: Rename's label, else the pane's title, and never the
+    /// agent name again. Safe, bounded text.
+    pub(super) pane: Option<String>,
     /// The daemon's `state_text` word when its sidebar config asks for it, so
     /// the GUI and the TUI name the status the same way: the agent's own
     /// state label when its integration set one.
@@ -139,6 +152,12 @@ pub(super) struct RowState {
 pub(super) trait RowLayout {
     fn workspace(&self, row: WorkspaceRow<'_>, state: RowState, cx: &RowContext<'_>) -> Div;
     fn agent(&self, row: AgentRow<'_>, state: RowState, cx: &RowContext<'_>) -> Div;
+    /// What carries a worktree child's tree guide on through the lines under
+    /// its row (note, ports) to the next sibling. Only layouts that draw
+    /// guides have one to continue.
+    fn trunk_below(&self, _key: &str, _tree: RowTree, _cx: &RowContext<'_>) -> Option<Div> {
+        None
+    }
 }
 
 /// One row waiting for its state: build it, mark it, then take the element.
@@ -179,11 +198,25 @@ impl<'a> Cell<'a> {
         self
     }
 
-    /// The row element, laid out for the state the cell was given.
+    /// The row element, laid out for the state the cell was given. The rail
+    /// style's bar is added here, on the row's leading edge, so every layout
+    /// shows it in the same place without drawing it itself.
     pub(super) fn row(self) -> Div {
-        match self.data {
-            RowData::Workspace(row) => self.layout.workspace(row, self.state, self.cx),
-            RowData::Agent(row) => self.layout.agent(row, self.state, self.cx),
+        let (row, rail) = match self.data {
+            RowData::Workspace(row) => {
+                let rail = (!row.removing)
+                    .then(|| self.cx.indicators.rail(row.status, row.label))
+                    .flatten();
+                (self.layout.workspace(row, self.state, self.cx), rail)
+            }
+            RowData::Agent(row) => {
+                let rail = self.cx.indicators.rail(row.status, &row.key);
+                (self.layout.agent(row, self.state, self.cx), rail)
+            }
+        };
+        match rail {
+            Some(rail) => row.relative().child(rail),
+            None => row,
         }
     }
 }

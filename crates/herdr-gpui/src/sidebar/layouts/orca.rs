@@ -8,7 +8,7 @@ use super::{
     super::{
         cell::{AgentRow, RowContext, RowLayout, RowState, WorkspaceRow},
         line_height,
-        row::{RowKind, RowTree, TokenLook, left_behind, token_column},
+        row::{Elbow, RowKind, RowTree, TokenLook, guide, left_behind, token_column},
         tokens::ResolvedToken,
         wash::HostMark,
     },
@@ -63,6 +63,40 @@ fn card(
     )
 }
 
+/// A child's guide gutter, as `(x, width)` from the sidebar's leading edge:
+/// the trunk drops from the leading edge of the parent's status mark, and the
+/// tick spans the indent to the child's mark, as the tree's tick meets its
+/// dot. The mark sits centred in its status column.
+fn gutter(cx: &RowContext<'_>) -> (f32, f32) {
+    let mark = (status_width(cx) - cx.indicators.width(cx.font)) / 2.;
+    (
+        MARGIN + cx.nest + BORDER + GAP + mark,
+        cx.look.density.card_indent(),
+    )
+}
+
+/// A child card's guide, drawn from the card itself: it lies in the indent
+/// to the card's left, and spans the card's border box so the trunk runs
+/// unbroken from card to card. `padding` is the card's top padding.
+fn card_guide(
+    key: &str,
+    tree: RowTree,
+    indent: f32,
+    padding: f32,
+    cx: &RowContext<'_>,
+) -> Option<Div> {
+    let (x, width) = gutter(cx);
+    let line = line_height(cx.font);
+    guide(
+        key,
+        tree,
+        (x - MARGIN - indent - BORDER, width),
+        Elbow::At(BORDER + padding + line / 2.),
+        cx,
+    )
+    .map(|guide| guide.top(px(-BORDER)).bottom(px(-BORDER)))
+}
+
 /// Width inside a card's margins, border, and padding, less its status
 /// column and the gap after it.
 fn inner(cx: &RowContext<'_>, indent: f32) -> f32 {
@@ -82,7 +116,13 @@ fn configured_status(
     cx: &RowContext<'_>,
 ) -> (Option<Div>, f32) {
     match parts::configured_status(lines, status, removing, cx) {
-        Some(mark) => (Some(status_column(mark, cx)), 0.),
+        Some(mark) => (
+            Some(
+                status_column(mark, cx)
+                    .when(cx.indicators.centered(), |column| column.self_center()),
+            ),
+            0.,
+        ),
         None => (None, status_width(cx) + GAP),
     }
 }
@@ -96,12 +136,22 @@ fn status_column(child: impl IntoElement, cx: &RowContext<'_>) -> Div {
         .child(child)
 }
 
+/// A card being removed fades to this while its worktree goes.
+const REMOVING_OPACITY: f32 = 0.5;
+
 impl RowLayout for Orca {
     fn workspace(&self, row: WorkspaceRow<'_>, state: RowState, cx: &RowContext<'_>) -> Div {
+        // Its marks fade with it, though the moving ones draw outside it.
+        let faded = row.removing.then(|| RowContext {
+            indicators: cx.indicators.faded(REMOVING_OPACITY),
+            ..*cx
+        });
+        let cx = faded.as_ref().unwrap_or(cx);
         let (branch, status, upstream) = (row.branch(), row.status(), row.upstream());
         let WorkspaceRow {
             label,
             tree,
+            icon,
             fold,
             grouped,
             badge,
@@ -126,6 +176,7 @@ impl RowLayout for Orca {
         let dirty = badge.as_ref().is_some_and(|badge| badge.dirty);
         let teleported = badge.as_ref().is_some_and(|badge| badge.teleported);
         let dirty_size = (line * 0.7).round().min(14.);
+        let worktree = parts::worktree(label, &icon, dirty_size);
         let meta = branch.is_some() || cx.host.is_some() || badge.is_some() || upstream.is_some();
         // The repository's own checkout is the group's primary card.
         let primary = (grouped && tree == RowTree::None).then(|| {
@@ -143,6 +194,9 @@ impl RowLayout for Orca {
         if !lines.is_empty() {
             let (mark, room) = configured_status(&lines, status, removing, cx);
             let text = Line::new(width + room, GAP)
+                .when_some(worktree, |text, glyph| {
+                    text.fixed(dirty_size, parts::first_line(dirty_size, glyph, cx))
+                })
                 .fill_with(|width| {
                     token_column(
                         label,
@@ -180,11 +234,13 @@ impl RowLayout for Orca {
             return card(label, state, indent, 8., (theme, cx.mark))
                 .items_start()
                 .py(px(5.))
-                .when(removing, |card| card.opacity(0.5))
+                .when(removing, |card| card.opacity(REMOVING_OPACITY))
+                .children(card_guide(label, tree, indent, 5., cx))
                 .children(mark)
                 .child(text.into_div().items_start());
         }
         let title = Line::new(width, GAP)
+            .when_some(worktree, |line, glyph| line.fixed(dirty_size, glyph))
             .fill(
                 div()
                     .debug_selector(|| format!("name-{label}"))
@@ -230,15 +286,20 @@ impl RowLayout for Orca {
                 let (width, number) = parts::pr_number(label, pr, small, glyph);
                 line.shrink(width, number)
             });
+        let padding = if meta { 5. } else { 7. };
         card(label, state, indent, 8., (theme, cx.mark))
             .items_start()
-            .py(px(if meta { 5. } else { 7. }))
-            .when(removing, |card| card.opacity(0.5))
-            .child(
-                status_column(parts::status(status, removing, cx), cx)
-                    .h(px(line))
-                    .items_center(),
-            )
+            .py(px(padding))
+            .when(removing, |card| card.opacity(REMOVING_OPACITY))
+            .children(card_guide(label, tree, indent, padding, cx))
+            .child({
+                let column = status_column(parts::status(status, removing, cx), cx);
+                if cx.indicators.centered() {
+                    column.self_center()
+                } else {
+                    column.h(px(line)).items_center()
+                }
+            })
             .child(
                 div()
                     .flex()
@@ -255,6 +316,10 @@ impl RowLayout for Orca {
                         )
                     }),
             )
+    }
+
+    fn trunk_below(&self, key: &str, tree: RowTree, cx: &RowContext<'_>) -> Option<Div> {
+        super::super::row::trunk_below(key, tree, gutter(cx), cx)
     }
 
     fn agent(&self, agent: AgentRow<'_>, state: RowState, cx: &RowContext<'_>) -> Div {
@@ -289,14 +354,26 @@ impl RowLayout for Orca {
                 .child(icon)
                 .child(column);
         }
-        // The agent leads, then where it runs, all on one line.
+        // The agent leads, then its pane, then where it runs, all on one line.
         let text = Line::new(inner(cx, 0.) - icon - GAP, GAP)
-            .fill(
+            .lead(
                 div()
                     .debug_selector(|| format!("name-{key}"))
                     .text_color(rgb(color)),
                 agent.name,
+                glyph_at(font, font.size),
+                0.4,
             )
+            .when_some(agent.pane, |line, pane| {
+                line.label(
+                    div()
+                        .debug_selector(|| format!("pane-{key}"))
+                        .text_color(rgb(theme.muted)),
+                    pane,
+                    glyph_at(font, font.size),
+                    0.5,
+                )
+            })
             .when_some(parts::agent_place(agent.place, cx.host), |line, place| {
                 line.label(
                     div().text_color(rgb(theme.muted)),
@@ -306,13 +383,13 @@ impl RowLayout for Orca {
                 )
             })
             .when_some(agent.status_text.as_deref(), |line, text| {
-                line.label(
+                line.keep(
                     div()
                         .debug_selector(|| format!("status-{key}"))
                         .text_color(rgb(cx.indicators.color(agent.status))),
                     text,
                     glyph_at(font, font.size),
-                    0.5,
+                    0.3,
                 )
             });
         card(key, state, 0., 4., (theme, cx.mark))

@@ -1,7 +1,7 @@
 use super::{Page, WorkspaceMenuAction};
 use crate::{
     HerdrWindow,
-    pull_request::{Input, Origin, Outcome, ReviewDecision, workspace_input},
+    pull_request::{Input, Origin, Outcome, ReviewDecision, View, workspace_input},
 };
 use gpui::{prelude::*, *};
 use herdr_client::protocol::*;
@@ -12,9 +12,33 @@ impl HerdrWindow {
     /// looked up for them: the verified local daemon, or a saved SSH device.
     /// Any other socket may be forwarded from an unknown machine.
     pub(crate) fn pr_origin(&self) -> Option<Origin> {
-        match &self.endpoints[self.selected_endpoint].connection.target {
+        self.endpoint_pr_origin(self.selected_endpoint)
+    }
+
+    /// Whose pull request answers a device's rows show: its checkouts' origin
+    /// and the account set they are read with, which differs between devices
+    /// signed in to their own accounts. Selected or not, so a device's rows
+    /// keep the answers found while it was selected.
+    pub(crate) fn endpoint_pr_view(&self, index: usize) -> Option<View> {
+        let origin = self.endpoint_pr_origin(index)?;
+        let profile = self.endpoint_pr_profile(index)?;
+        Some(View {
+            origin,
+            login: self.tokens_over(profile).key(),
+        })
+    }
+
+    /// [`Self::pr_origin`] for any device, selected or not.
+    fn endpoint_pr_origin(&self, index: usize) -> Option<Origin> {
+        let endpoint = self.endpoints.get(index)?;
+        let live = if index == self.selected_endpoint {
+            &self.live
+        } else {
+            &endpoint.live
+        };
+        match &endpoint.connection.target {
             herdr_client::ConnectTarget::Ssh { target, .. } => Some(Origin::Ssh(target.clone())),
-            _ if self.selected_endpoint == 0 && self.live.local_daemon_peer => Some(Origin::Local),
+            _ if index == 0 && live.local_daemon_peer => Some(Origin::Local),
             _ => None,
         }
     }
@@ -36,16 +60,13 @@ impl HerdrWindow {
             if target.branch.as_deref().is_none_or(str::is_empty)
                 || (target.worktree.is_none() && origin != Some(Origin::Local))
             {
-                return Err(crate::Error::PrMetadata);
+                return Err(herdr_github::pull_request::Error::Metadata.into());
             }
-            let origin = origin.ok_or(crate::Error::PrUntrustedEndpoint)?;
+            let origin = origin.ok_or(herdr_github::pull_request::Error::UntrustedEndpoint)?;
             if !self.workspace_pr_target_current() {
                 return Err(crate::Error::StaleWorkspace);
             }
-            let workspace = self
-                .menu_target_workspace()
-                .ok_or(crate::Error::StaleWorkspace)?;
-            workspace_input(workspace, &origin)
+            self.menu_target_input(&origin)
         })();
         match result {
             Ok(input) => {
@@ -69,20 +90,24 @@ impl HerdrWindow {
             .as_ref()
             .and_then(std::sync::Weak::upgrade)
             .is_some_and(|old| Arc::ptr_eq(&old, &endpoint.connection.inbox));
+        // Another connection's lookups stop, but what they found stays shown
+        // until this one refreshes it.
         if !same_connection {
-            self.menu.pr_cache.clear();
+            self.menu.pr_cache.suspend();
             self.menu.pr_cache_connection = Some(Arc::downgrade(&endpoint.connection.inbox));
         }
-        if let (Some(snapshot), Some(profile), Some(origin)) =
-            (&self.live.snapshot, self.pr_profile(), self.pr_origin())
+        if let (Some(snapshot), Some(tokens), Some(origin)) =
+            (&self.live.snapshot, self.pr_tokens(), self.pr_origin())
         {
             let scope = (
                 self.selection_epoch,
                 self.endpoints[self.selected_endpoint].generation,
                 snapshot.boot_id.clone(),
             );
-            let token = profile.token.clone();
-            self.menu.pr_cache.scope(scope, token, origin);
+            // Answers belong to the whole account set: adding or signing in
+            // an account may change which one reads a repository.
+            let key = tokens.key();
+            self.menu.pr_cache.scope(scope, tokens, &key, origin);
         }
     }
 
@@ -111,9 +136,38 @@ impl HerdrWindow {
             .filter(|snapshot| snapshot.boot_id == target.boot_id)?;
         snapshot.workspaces.iter().find(|workspace| {
             workspace.workspace_id == target.id
-                && workspace.worktree == target.worktree
+                && super::workspace::known_worktree(workspace) == target.worktree
                 && workspace.branch == target.branch
+                && target.addresses(workspace)
         })
+    }
+
+    /// The repository lookup for the menu's workspace, read through what the
+    /// menu trusts of it. A main checkout whose shell left the repository
+    /// Herdr keeps for it is looked up by its current directory, which
+    /// `workspace_input` already prefers over that metadata. A linked
+    /// checkout routed through such a main checkout is looked up by its
+    /// repository's Git directory and its own branch, which belong together.
+    pub(super) fn menu_target_input(&self, origin: &Origin) -> crate::Result<Input> {
+        let target = self
+            .menu
+            .target
+            .as_ref()
+            .ok_or(crate::Error::StaleWorkspace)?;
+        let workspace = self
+            .menu_target_workspace()
+            .ok_or(crate::Error::StaleWorkspace)?;
+        match (&target.source, &target.base) {
+            (super::workspace::Source::Repository { key, .. }, Some(branch)) => {
+                crate::worktree::validate_branch(branch)?;
+                Ok(Input {
+                    checkout: None,
+                    repo_key: Some(key.clone()),
+                    branch: branch.clone(),
+                })
+            }
+            _ => Ok(workspace_input(workspace, origin)?),
+        }
     }
 
     pub(crate) fn update_workspace_pr(&mut self) -> bool {
@@ -132,6 +186,7 @@ impl HerdrWindow {
             .filter(|_| self.live.status.is_connected() && self.live.snapshot.is_some());
         if let Some(origin) = origin {
             self.sync_pr_scope();
+            self.menu.pr_cache.idle = !self.active;
             let now = std::time::Instant::now();
             if let Some(snapshot) = &self.live.snapshot {
                 if self
@@ -163,7 +218,7 @@ impl HerdrWindow {
                         .find(|workspace| Some(workspace.workspace_id.as_str()) == priority)
                         && let Ok(input) = workspace_input(workspace, &origin)
                     {
-                        self.menu.pr_cache.expire_missing(&input, now);
+                        self.menu.pr_cache.expire_viewed(&input, now);
                     }
                     let inputs =
                         workspace_pr_inputs(snapshot, &origin, priority, self.menu.pr_cache.cursor);
@@ -172,7 +227,8 @@ impl HerdrWindow {
             }
             changed |= self.menu.pr_cache.poll(now);
         } else {
-            self.menu.pr_cache.clear();
+            // A dropped connection keeps the last answers for its return.
+            self.menu.pr_cache.suspend();
         }
         if self.menu.page == Some(Page::Workspace) && !self.workspace_pr_target_current() {
             if self.menu.pr.message.as_deref()
@@ -287,7 +343,10 @@ impl HerdrWindow {
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(pill(value.lifecycle().into(), value.color(theme)))
+                            .child(pill(
+                                value.lifecycle().into(),
+                                crate::pull_request::color(value, theme),
+                            ))
                             .child(
                                 div()
                                     .id("workspace-pr-title")
@@ -426,13 +485,28 @@ impl HerdrWindow {
             .ok_or(crate::Error::StaleWorkspace)?;
         let input = workspace_input(workspace, &Origin::Local)?;
         self.menu.github = crate::github::Auth::connected_fixture();
-        self.live.local_daemon_peer = true;
-        self.sync_pr_scope();
-        self.menu
-            .pr_cache
-            .seed(input, value, std::time::Instant::now());
+        self.seed_pr(input, value, std::time::Instant::now());
         self.refresh_workspace_pr();
         Ok(())
+    }
+
+    /// Records `value` as the prefetch would: signed in, under the selected
+    /// device's view, which on this machine needs a verified local daemon.
+    #[cfg(any(test, all(feature = "integration-test", target_os = "macos")))]
+    pub(crate) fn seed_pr(
+        &mut self,
+        input: Input,
+        value: crate::pull_request::PullRequest,
+        now: std::time::Instant,
+    ) {
+        if !self.menu.github.connected() {
+            self.menu.github = crate::github::Auth::connected_fixture();
+        }
+        if self.selected_endpoint == 0 {
+            self.live.local_daemon_peer = true;
+        }
+        self.sync_pr_scope();
+        self.menu.pr_cache.seed(input, value, now);
     }
 
     #[cfg(any(test, feature = "integration-test"))]

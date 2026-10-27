@@ -45,7 +45,7 @@ fn system_notification_click_opens_its_origin_and_rejects_a_reconnect(
         );
     });
 
-    cx.update(|_, cx| crate::window::system_notifications::install(cx));
+    cx.update(|_, cx| crate::window::system_notifications::install_registry(cx));
     view.update(cx, |view, _| view.endpoints[1].toasts.receive([second]));
     post(&view, cx);
     let shown = cx.shown_system_notifications();
@@ -54,7 +54,8 @@ fn system_notification_click_opens_its_origin_and_rejects_a_reconnect(
     };
     assert_eq!(shown.tag, "herdr:ssh:notify:boot-v1:w1:p1");
     assert_eq!(shown.title, "Agent needs attention");
-    assert_eq!(shown.body, "ssh:notify\nReview needed");
+    // The agent's task, then the host leading its place.
+    assert_eq!(shown.body, "Review\nssh:notify · main");
     assert!(shown.actions.is_empty());
     assert_eq!(
         cx.app_identity(),

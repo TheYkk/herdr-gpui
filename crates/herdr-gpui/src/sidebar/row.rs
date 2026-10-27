@@ -21,7 +21,7 @@ mod badge;
 mod configured;
 
 pub(crate) use badge::compact;
-pub(super) use badge::{PrBadge, RowBadge, Upstream};
+pub(super) use badge::{Counts, PrBadge, RowBadge, Upstream};
 use configured::configured_lines;
 pub(crate) use configured::styled;
 pub(super) use configured::{
@@ -29,18 +29,33 @@ pub(super) use configured::{
 };
 
 /// What a row shows in its leading icon slot: a repository owner's avatar when
-/// one is cached, the GitHub mark while it is not, and nothing for the child
-/// rows that reserve no slot at all.
+/// one is cached, the GitHub mark while it is not, an empty slot for a folder
+/// that is not a Git checkout, so its name lines up with the rows around it,
+/// and nothing for a row that reserves no slot at all: a child row, or any
+/// row while the repository icons are turned off. A linked worktree that is
+/// not nested under its main checkout shows the branch glyph in its own hue
+/// instead, so it never relies on colour alone.
 pub(super) enum RowIcon {
     None,
+    Blank,
     Mark,
     Avatar(Arc<Image>),
+    Worktree(u32),
 }
 
 impl RowIcon {
+    /// Whether the slot shows something; a blank one only keeps the room.
+    pub(super) fn draws(&self) -> bool {
+        matches!(self, Self::Mark | Self::Avatar(_) | Self::Worktree(_))
+    }
+
     fn slot(self, key: &str, font: &FontConfig, color: u32) -> Div {
+        let probe = match self {
+            Self::Worktree(_) => "worktree-icon",
+            _ => "github",
+        };
         div()
-            .debug_selector(|| format!("github-{key}"))
+            .debug_selector(|| format!("{probe}-{key}"))
             .absolute()
             .left_0()
             .top(px((line_height(font) - 12.) / 2.))
@@ -54,8 +69,13 @@ impl RowIcon {
     /// avatar still loading or failing to decode shows the mark instead.
     pub(super) fn element(self, color: u32) -> AnyElement {
         match self {
-            Self::None => Empty.into_any_element(),
+            Self::None | Self::Blank => Empty.into_any_element(),
             Self::Mark => github_mark(color).size_full().into_any_element(),
+            Self::Worktree(hue) => svg()
+                .path("icons/git-branch.svg")
+                .size_full()
+                .text_color(rgb(hue))
+                .into_any_element(),
             Self::Avatar(image) => img(image)
                 .size_full()
                 .rounded_full()
@@ -137,14 +157,14 @@ pub(super) enum RowTree {
 }
 
 /// Trunk and tick for a child row, given the gutter the row reserves between
-/// the parent's label column and the child's status dot. Snapped to whole
-/// device pixels and painted as quads rather than borders: a bordered box
-/// rounds each edge on its own, which left the trunk thinner than its tick.
+/// the parent's label column and the child's leading mark, with the tick at
+/// `middle`, the middle of the row's first line. Snapped to whole device
+/// pixels and painted as quads rather than borders: a bordered box rounds
+/// each edge on its own, which left the trunk thinner than its tick.
 pub(super) fn tree_lines(
     gutter: Bounds<Pixels>,
     tree: RowTree,
-    font: &FontConfig,
-    padding: f32,
+    middle: Pixels,
     scale: f32,
 ) -> [Bounds<Pixels>; 2] {
     let device = |value: Pixels| f32::from(value) * scale;
@@ -152,11 +172,9 @@ pub(super) fn tree_lines(
     let weight = scale.round().max(1.);
     let snap = |value: Pixels| logical(device(value).round());
     // The trunk runs down the gutter's leading edge; the tick crosses it at the
-    // status dot's middle row and stops where the dot begins.
+    // row's first line and stops where the row's leading mark begins.
     let x = snap(gutter.origin.x);
-    let middle = logical(
-        (device(gutter.origin.y + px(padding + line_height(font) / 2.)) - weight / 2.).round(),
-    );
+    let middle = logical((device(middle) - weight / 2.).round());
     let end = if tree == RowTree::LastChild {
         middle + logical(weight)
     } else {
@@ -172,6 +190,117 @@ pub(super) fn tree_lines(
             point(snap(gutter.right()), middle + logical(weight)),
         ),
     ]
+}
+
+/// Where a guide's tick meets its row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Elbow {
+    /// This far below the row's top: the middle of its first line.
+    At(f32),
+    /// Halfway down the row, for a row that centres its one line.
+    Middle,
+}
+
+/// The gutter a child of Herdr's rows reserves for its guide, as `(x,
+/// width)` from the sidebar's leading edge: from the parent's label column
+/// to the child's status dot. A configured indent or gap can leave none.
+pub(super) fn tree_gutter(cx: &RowContext<'_>) -> (f32, f32) {
+    let layout = cx.look.density;
+    let extra_status_width = cx.indicators.width(cx.font) - STATUS_WIDTH;
+    (
+        cx.nest + cx.look.tree_gutter() + extra_status_width,
+        layout.padding() + layout.child_indent() - layout.tree_gutter(),
+    )
+}
+
+/// A worktree child's guide: a trunk down the leading edge of `gutter`
+/// (`x` and width, in the row's own coordinates) and a tick across it at
+/// `elbow`, ending where the row's leading mark begins. A last child's
+/// trunk stops at its tick. Every layout draws its guides with this, in the
+/// tree's muted colour and one device pixel's weight, so they read as one
+/// family. None for a parent, while the look draws no guides, or when the
+/// gutter has no room. Absolute: the row must be relative.
+pub(super) fn guide(
+    key: &str,
+    tree: RowTree,
+    (x, width): (f32, f32),
+    elbow: Elbow,
+    cx: &RowContext<'_>,
+) -> Option<Div> {
+    if tree == RowTree::None || !cx.look.density.tree_lines || width <= 0. {
+        return None;
+    }
+    let color = cx.theme.muted;
+    let key = key.to_owned();
+    Some(
+        div()
+            .debug_selector(move || format!("tree-{key}"))
+            .absolute()
+            .left(px(x))
+            .w(px(width))
+            .top_0()
+            .bottom_0()
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let middle = match elbow {
+                            Elbow::At(depth) => bounds.origin.y + px(depth),
+                            Elbow::Middle => bounds.center().y,
+                        };
+                        for line in tree_lines(bounds, tree, middle, window.scale_factor()) {
+                            window.paint_quad(fill(line, rgb(color)));
+                        }
+                    },
+                )
+                .size_full(),
+            ),
+    )
+}
+
+/// The trunk a child row's guide carries on through the lines that ride
+/// under it (its note, its ports), so the next sibling stays tied to the same
+/// tree. `gutter` is the row's guide gutter, from the sidebar's leading edge.
+/// A last child's elbow has already ended, so it has none, and neither does
+/// a row whose look draws no guides. Absolute: the caller places it in a
+/// relative box spanning those lines.
+pub(super) fn trunk_below(
+    key: &str,
+    tree: RowTree,
+    (x, width): (f32, f32),
+    cx: &RowContext<'_>,
+) -> Option<Div> {
+    if tree != RowTree::Child || !cx.look.density.tree_lines || width <= 0. {
+        return None;
+    }
+    let color = cx.theme.muted;
+    let key = key.to_owned();
+    Some(
+        div()
+            .debug_selector(move || format!("trunk-{key}"))
+            .absolute()
+            .left(px(x))
+            .w(px(width))
+            .top_0()
+            .bottom_0()
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let scale = window.scale_factor();
+                        let snap = |value: Pixels| px((f32::from(value) * scale).round() / scale);
+                        let x = snap(bounds.origin.x);
+                        let weight = px(scale.round().max(1.) / scale);
+                        let trunk = Bounds::from_corners(
+                            point(x, snap(bounds.origin.y)),
+                            point(x + weight, snap(bounds.bottom())),
+                        );
+                        window.paint_quad(fill(trunk, rgb(color)));
+                    },
+                )
+                .size_full(),
+            ),
+    )
 }
 
 /// A row's first line: segments joined by upstream's separator, the primary one
@@ -263,7 +392,8 @@ pub(super) fn removing_dot(selector: &'static str, theme: &Theme) -> Div {
                 .bg(rgb(theme.primary()))
                 .with_animation(
                     SharedString::from(format!("{selector}-pulse")),
-                    Animation::new(std::time::Duration::from_secs(1)).repeat(),
+                    Animation::new(crate::motion::duration(std::time::Duration::from_secs(1)))
+                        .repeat(),
                     |dot, delta| dot.opacity(0.3 + 0.7 * (delta * std::f32::consts::PI).sin()),
                 ),
         )
@@ -308,19 +438,19 @@ pub(super) fn row(
     } else {
         0
     };
-    let padding = layout.padding();
     let content_x = look.content_x();
     let gap = layout.gap();
     let vertical_padding = look.row_padding();
     // Content starts below the highlight's edge, which sits half the row
     // spacing in from the row's own.
     let content_top = vertical_padding + look.spacing() / 2.;
-    let show_detail = matches!(kind, RowKind::Agent(_))
-        || if tree == RowTree::None {
-            layout.workspace_details()
-        } else {
-            layout.child_details()
-        };
+    // An agent with nothing to say below its name, such as one nested under
+    // the workspace that names its place, takes one line.
+    let show_detail = match kind {
+        RowKind::Agent(_) => !detail.is_empty(),
+        RowKind::Workspace if tree == RowTree::None => layout.workspace_details(),
+        RowKind::Workspace => layout.child_details(),
+    };
     let (name_color, weight, detail_color) = row_text(kind, focused, theme);
     let name_color = if teleported {
         left_behind(name_color, theme)
@@ -340,13 +470,13 @@ pub(super) fn row(
         } else {
             layout.child_indent() + extra_status_width
         };
-    // Room for tree lines between the parent's label column and this row's own
-    // dot: `child_indent - STATUS_WIDTH - gap`. A configured indent or gap can
-    // leave none, and then no lines are drawn rather than a box of negative width.
-    let tree_width = padding + indent - cx.nest - layout.tree_gutter() - extra_status_width;
-    let draw_tree = tree != RowTree::None && look.density.tree_lines && tree_width > 0.;
-    let arrow_reserve = if reserve_arrow { ARROW_RESERVE } else { 0. };
-    let arrow_absent = arrow.is_none();
+    // Only a drawn chevron takes its column. The badge hugs the row's edge
+    // either way, so an empty column would only cut a group member's name.
+    let arrow_reserve = if reserve_arrow && arrow.is_some() {
+        ARROW_RESERVE
+    } else {
+        0.
+    };
     let status_gutter = if show_status { status_width + gap } else { 0. };
     let available = (look.content_width(width) - status_gutter - indent - arrow_reserve).max(0.);
     // Narrow sidebars and large fonts can leave less room than a badge needs.
@@ -354,8 +484,20 @@ pub(super) fn row(
     let badge_width = badge.as_ref().map_or(0., |badge| {
         badge.width(font, &layout).min((available - gap).max(0.))
     });
+    // The label's first line yields only the badge's first line; the counts
+    // under it take their room from the second line. A fold chevron is a
+    // click target as tall as the row, so beside one the label still yields
+    // the whole column.
+    let hanging = badge.as_ref().filter(|_| arrow.is_none());
+    let badge_first = hanging.map_or(badge_width, |badge| {
+        badge.first_width(font, &layout).min(badge_width)
+    });
+    let counts_reserve = hanging
+        .map(|badge| badge.counts_width(font, &layout).min(badge_width))
+        .filter(|width| *width > 0.)
+        .map_or(0., |width| width + gap);
     let pr_reserve = if badge.is_some() {
-        badge_width + gap
+        badge_first + gap
     } else {
         0.
     };
@@ -392,6 +534,7 @@ pub(super) fn row(
         0.
     };
     let label_width = (available - pr_reserve - status_reserve - upstream_reserve).max(0.);
+    let detail_limit = label_width.min((available - counts_reserve).max(0.));
     let agent_icon = match kind {
         RowKind::Agent(icon) => Some(icon),
         RowKind::Workspace => None,
@@ -425,54 +568,35 @@ pub(super) fn row(
         .gap(px(gap))
         .py(px(content_top))
         .cursor_pointer()
-        .map(|row| cx.mark.apply(row, key, &look))
-        .map(|row| look.mark(row, key, state, theme))
+        .map(|row| look.mark(row, key, (state, cx.mark), theme))
         // Tree lines run in the indent the row already reserves, so a child is
         // tied to its parent without box-drawing glyphs in the label.
-        .when(draw_tree, |row| {
-            let (color, font) = (theme.muted, font.clone());
-            let gutter = cx.nest + look.tree_gutter() + extra_status_width;
-            row.child(
-                div()
-                    .debug_selector(|| format!("tree-{key}"))
-                    .absolute()
-                    .left(px(gutter))
-                    .w(px(tree_width))
-                    .top_0()
-                    .bottom_0()
-                    .child(
-                        canvas(
-                            |_, _, _| (),
-                            move |bounds, _, window, _| {
-                                for line in tree_lines(
-                                    bounds,
-                                    tree,
-                                    &font,
-                                    content_top,
-                                    window.scale_factor(),
-                                ) {
-                                    window.paint_quad(fill(line, rgb(color)));
-                                }
-                            },
-                        )
-                        .size_full(),
-                    ),
-            )
-        })
+        .children(guide(
+            key,
+            tree,
+            tree_gutter(cx),
+            Elbow::At(content_top + line_height(font) / 2.),
+            cx,
+        ))
         .when(show_status, |row| {
-            row.child(if removing {
-                div()
-                    .w(px(indicators.width(font)))
-                    .mt(px((line_height(font) - STATUS_WIDTH) / 2.))
-                    .flex_none()
-                    .flex()
-                    .justify_center()
-                    .child(removing_dot("worktree-removing", theme))
-            } else if let Some(token) = leading_icon {
-                configured_status(token, status, cx)
-            } else {
-                status_indicator(status, font, indicators)
-            })
+            let centered = indicators.centered();
+            row.child(
+                if removing {
+                    div()
+                        .w(px(indicators.width(font)))
+                        .mt(px((line_height(font) - STATUS_WIDTH) / 2.))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(removing_dot("worktree-removing", theme))
+                } else if let Some(token) = leading_icon {
+                    configured_status(token, status, cx)
+                } else {
+                    status_indicator(status, font, indicators)
+                }
+                .debug_selector(|| format!("mark-{key}"))
+                .when(centered, |slot| slot.mt_0().self_center()),
+            )
         })
         .child(
             div()
@@ -496,7 +620,7 @@ pub(super) fn row(
                                 focused,
                                 teleported,
                             },
-                            label_width,
+                            (label_width, detail_limit),
                             workspace_icon,
                             cx,
                         );
@@ -510,7 +634,7 @@ pub(super) fn row(
                                 .when_some(agent_first, |line, icon| {
                                     line.child(agent_mark(key, icon, agent_size, name_color, font))
                                 })
-                                .when(!matches!(workspace_icon, RowIcon::None), |title| {
+                                .when(workspace_icon.draws(), |title| {
                                     title.child(workspace_icon.slot(key, font, muted))
                                 })
                                 .child(
@@ -526,8 +650,8 @@ pub(super) fn row(
                         )
                         .when(show_detail, |column| {
                             let detail_x =
-                                agent_detail.map_or(0., |_| agent_reserve.min(label_width));
-                            let room = (label_width - detail_x).max(0.);
+                                agent_detail.map_or(0., |_| agent_reserve.min(detail_limit));
+                            let room = (detail_limit - detail_x).max(0.);
                             // The counts follow the branch and win the room it would
                             // take, so a long branch ellipsizes before they do.
                             let (detail_width, upstream_x) = match upstream_inline {
@@ -543,7 +667,7 @@ pub(super) fn row(
                             column.child(
                                 div()
                                     .relative()
-                                    .w(px(label_width))
+                                    .w(px(detail_limit))
                                     .h(px(line_height(font)))
                                     .when_some(agent_detail, |line, icon| {
                                         line.child(agent_mark(
@@ -604,16 +728,17 @@ pub(super) fn row(
                     .child(upstream.element(key, glyph, theme)),
             )
         })
-        // The collapse column comes first so the badge can hug the row's edge;
-        // a reserved-but-empty column keeps every badge on the same right edge.
+        // The collapse column comes first so the badge can hug the row's edge.
         .when_some(arrow, |row, arrow| row.child(arrow))
-        .when(arrow_absent && reserve_arrow, |row| {
-            // The row's gap already covers part of the reserve; a wide gap
-            // covers all of it.
-            row.child(div().w(px((ARROW_RESERVE - gap).max(0.))).flex_none())
-        })
         .when_some(badge, |row, badge| {
-            row.child(badge.element(key, badge_width, font, theme, &layout))
+            let element = badge.element(key, badge_width, font, theme, &layout);
+            if badge_first >= badge_width {
+                return row.child(element);
+            }
+            // Only the first line holds its place in the flow; the wider counts
+            // line hangs at the row's edge, beside the shortened detail line.
+            row.child(div().w(px(badge_first)).flex_none())
+                .child(element.absolute().top(px(content_top)).right(px(content_x)))
         })
 }
 
@@ -635,7 +760,7 @@ fn agent_mark(
         .left_0()
         .top(px((line_height(font) - size) / 2.))
         .size(px(size))
-        .child(svg().path(icon.path()).size_full().text_color(rgb(color)))
+        .child(icon.element(size, color))
 }
 
 pub(crate) fn label_text(text: &str) -> impl IntoElement {

@@ -113,6 +113,8 @@ impl HerdrWindow {
             mono: &self.config.terminal,
             indicators: Indicators::new(
                 self.settings.shared.as_ref(),
+                self.config.status_icons,
+                self.config.edge_rail,
                 matches!(
                     cx.window_appearance(),
                     WindowAppearance::Light | WindowAppearance::VibrantLight
@@ -127,7 +129,6 @@ impl HerdrWindow {
         &self,
         slot: Slot,
         tab: &Tab,
-        gap: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = tab.id;
@@ -135,7 +136,6 @@ impl HerdrWindow {
             return div()
                 .id(SharedString::from(slot.selector("devices-loading")))
                 .size_full()
-                .pl(px(gap))
                 .into_any_element();
         };
         let look = self.overview_look(cx);
@@ -152,7 +152,6 @@ impl HerdrWindow {
             .debug_selector(move || slot.selector("devices-tab"))
             .size_full()
             .min_w_0()
-            .pl(px(gap))
             .track_focus(&focus)
             .bg(rgb(look.theme.background))
             .text_color(rgb(look.theme.foreground))
@@ -214,6 +213,7 @@ impl HerdrWindow {
                                         slot,
                                         id,
                                         &page.expanded,
+                                        self.config.gpu_sampled(),
                                         cx,
                                     )),
                             ),

@@ -2,8 +2,12 @@
 use super::*;
 use herdr_client::{ClientEvent, SavedHost};
 
+#[cfg(feature = "container")]
+mod container_stop;
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod local_peer_warning;
+mod staged_notifications;
 
 #[test]
 fn saved_profile_ids_are_the_catalog_ids_behind_ssh_endpoints() {
@@ -11,6 +15,16 @@ fn saved_profile_ids_are_the_catalog_ids_behind_ssh_endpoints() {
     assert_eq!(saved_profile_id(&format!("ssh:{id}")), Some(id));
     for endpoint in [id, LOCAL, "ssh:", "ssh:fixture", "ssh:../x"] {
         assert_eq!(saved_profile_id(endpoint), None, "{endpoint}");
+    }
+}
+
+impl Endpoint {
+    /// Attaches `handle` the way `connect` leaves the shown endpoint, with its
+    /// surface requested, for window tests that run without a daemon.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn attach_shown(&mut self, handle: ClientHandle) {
+        self.connection.handle = Some(handle);
+        self.initial_surface = true;
     }
 }
 
@@ -359,23 +373,23 @@ fn device_filter_follows_navigation_and_catalog_retirement(cx: &mut gpui::TestAp
         view.reconcile_catalog(vec![host("a", true), host("b", true)], Vec::new(), cx);
         assert!(view.select_endpoint("ssh:a", cx));
         assert!(
-            view.device_filter.is_none(),
+            view.device_filter == crate::menu::DeviceScope::All,
             "All Devices stays an aggregate"
         );
-        view.device_filter = Some("ssh:a".into());
+        view.device_filter = crate::menu::DeviceScope::only("ssh:a");
         assert!(view.select_endpoint("ssh:b", cx));
-        assert_eq!(view.device_filter.as_deref(), Some("ssh:b"));
+        assert_eq!(view.device_filter, crate::menu::DeviceScope::only("ssh:b"));
         let mut renamed = host("b", true);
         renamed.label = "Renamed device".into();
         view.reconcile_catalog(vec![renamed], Vec::new(), cx);
-        assert_eq!(view.device_filter.as_deref(), Some("ssh:b"));
+        assert_eq!(view.device_filter, crate::menu::DeviceScope::only("ssh:b"));
         view.reconcile_catalog(vec![host("b", false)], Vec::new(), cx);
-        assert_eq!(view.device_filter.as_deref(), Some(LOCAL));
+        assert_eq!(view.device_filter, crate::menu::DeviceScope::only(LOCAL));
         assert!(!view.select_endpoint("ssh:b", cx));
         view.reconcile_catalog(vec![host("b", true)], Vec::new(), cx);
         assert!(view.select_endpoint("ssh:b", cx));
         view.reconcile_catalog(vec![], Vec::new(), cx);
-        assert_eq!(view.device_filter.as_deref(), Some(LOCAL));
+        assert_eq!(view.device_filter, crate::menu::DeviceScope::only(LOCAL));
     });
 }
 

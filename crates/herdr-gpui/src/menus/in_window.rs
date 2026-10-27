@@ -1,4 +1,4 @@
-//! Linux presentation of the same menu tree installed in macOS's menu bar.
+//! Linux and Windows presentation of the same menu tree installed in macOS's menu bar.
 //! The shared popup state isolates terminal input; actions are dispatched only
 //! after restoring the focus from before the menu opened.
 
@@ -92,13 +92,16 @@ impl OpenMenu {
 
 /// Action availability belongs to the previously focused element, not the
 /// popup that is about to take focus. OS-only menu entries aren't selectable.
-fn validate(menu: &mut OwnedMenu, window: &Window, cx: &App) {
+fn validate(menu: &mut OwnedMenu, window: &Window, cx: &mut App) {
     for item in &mut menu.items {
         match item {
             OwnedMenuItem::Action {
                 action, disabled, ..
             } => {
-                *disabled |= !window.is_action_available(action.as_ref(), cx);
+                // The window's dispatch tree misses app-wide handlers such as
+                // Quit's, which only the app's own check counts.
+                *disabled |= !window.is_action_available(action.as_ref(), cx)
+                    && !cx.is_action_available(action.as_ref());
             }
             OwnedMenuItem::Submenu(menu) => validate(menu, window, cx),
             _ => {}
@@ -113,7 +116,7 @@ impl HerdrWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if cfg!(target_os = "linux")
+        if super::IN_WINDOW
             && self.menu.page.is_none()
             && event.keystroke.key == "f10"
             && event.keystroke.modifiers == Modifiers::default()
@@ -140,7 +143,7 @@ impl HerdrWindow {
             return;
         }
         let return_focus = window.focused(cx);
-        let mut menus: Vec<_> = super::menus(self.config.layout)
+        let mut menus: Vec<_> = super::menus(&self.config)
             .into_iter()
             .map(Menu::owned)
             .collect();
@@ -163,6 +166,16 @@ impl HerdrWindow {
         menu.select_first();
         self.menu.application = Some(menu);
         self.menu.page = Some(Page::Application);
+        cx.notify();
+    }
+
+    /// Closes the open popup, which keeps its own copy of the menus, once a
+    /// config change rebuilds the bar so it cannot offer items that left.
+    pub(crate) fn close_stale_application_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.application.take().is_none() {
+            return;
+        }
+        self.menu.page = None;
         cx.notify();
     }
 

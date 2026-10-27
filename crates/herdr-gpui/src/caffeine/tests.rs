@@ -7,8 +7,13 @@ use std::{
     thread::ThreadId,
 };
 
+mod changes;
 mod hidden_cup;
+mod right_click;
+mod scope;
 mod toggle;
+mod until_agents;
+mod work;
 
 /// Where a stand-in hold was made and released, in order.
 #[derive(Clone, Default)]
@@ -36,9 +41,9 @@ impl Drop for Held {
     }
 }
 
-fn holder(log: &Log) -> impl FnMut() -> keepawake::Result<Held> + Send + 'static {
+fn holder(log: &Log) -> impl FnMut(AwakeScope) -> keepawake::Result<Held> + Send + 'static {
     let log = log.clone();
-    move || {
+    move |_| {
         log.push(Command::Hold);
         Ok(Held(log.clone()))
     }
@@ -46,19 +51,28 @@ fn holder(log: &Log) -> impl FnMut() -> keepawake::Result<Held> + Send + 'static
 
 /// Collects what `toggle` reports, for the test to inspect afterwards.
 #[derive(Clone, Default)]
-struct Reports(Rc<RefCell<Vec<Error>>>);
+struct Reports(Rc<RefCell<Vec<crate::Error>>>);
 
 impl Reports {
-    fn sink(&self) -> impl FnOnce(Error, &mut App) + 'static {
+    fn sink(&self) -> impl FnOnce(crate::Error, &mut App) + 'static {
         let reports = self.0.clone();
         move |error, _| reports.borrow_mut().push(error)
     }
 
-    fn take(&self) -> Vec<Error> {
+    fn take(&self) -> Vec<crate::Error> {
         self.0.take()
     }
 }
 
 fn cup_of(cx: &mut gpui::TestAppContext) -> Cup {
     cx.update(|cx| cup(cx))
+}
+
+/// A stand-in window that a test reports work for.
+fn window(id: u64) -> WindowId {
+    WindowId::from(id)
+}
+
+fn commands(log: &Log) -> Vec<Command> {
+    log.entries().iter().map(|(command, _)| *command).collect()
 }

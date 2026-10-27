@@ -1,5 +1,6 @@
 """Isolated receiver tests: no running app or personal control socket is used."""
 
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -11,8 +12,44 @@ import time
 import unittest
 
 
+BASH = shutil.which("bash")
+
+
+def sh_quote(value):
+    """Double-quote a value for a POSIX sh script."""
+    escaped = value.replace("\\", "\\\\")
+    for character in ('"', "$", "`"):
+        escaped = escaped.replace(character, "\\" + character)
+    return f'"{escaped}"'
+
+
+def process_exists(pid):
+    """Return whether `pid` names a running process."""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+    # os.kill(pid, 0) is not a liveness probe on Windows: it raises
+    # WinError 87 for any pid, so ask the kernel for the exit code instead.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code))
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
 class WaitTests(unittest.TestCase):
     def setUp(self):
+        if BASH is None:
+            self.fail("bash is not on PATH; wait.sh needs it")
         self.directory = tempfile.TemporaryDirectory(prefix="mockup-wait-")
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
@@ -21,9 +58,9 @@ class WaitTests(unittest.TestCase):
         shutil.copyfile(Path(__file__).with_name("wait.sh"), self.script)
         app = self.root / "target/debug/herdr-gpui"
         app.parent.mkdir(parents=True)
-        app.write_text(
-            f"#!{sys.executable}\n"
-            "import json, os, pathlib, signal, sys\n"
+        fake = app.with_name("fake_app.py")
+        fake.write_text(
+            "import json, os, pathlib, signal, sys, time\n"
             "root = pathlib.Path(os.environ['TEST_ROOT'])\n"
             "(root / 'called').write_text(json.dumps(sys.argv[1:]))\n"
             "mode = os.environ['TEST_MODE']\n"
@@ -32,11 +69,18 @@ class WaitTests(unittest.TestCase):
             "    sys.exit(0)\n"
             "if mode == 'waiting':\n"
             "    (root / 'pid').write_text(str(os.getpid()))\n"
-            "    signal.pause()\n"
+            # Windows has no signal.pause; sleeping keeps the request open
+            # until wait.sh stops it.
+            "    signal.pause() if hasattr(signal, 'pause') else time.sleep(60)\n"
             "if mode == 'refused':\n"
             "    sys.stderr.write('Request refused\\n')\n"
             "    sys.exit(1)\n"
             "sys.exit(3 if mode == 'absent' else 4)\n"
+        )
+        app.write_text(
+            "#!/bin/sh\n"
+            f"exec {sh_quote(Path(sys.executable).as_posix())} "
+            f'{sh_quote(fake.as_posix())} "$@"\n'
         )
         app.chmod(0o700)
         self.feedback = self.root / "feedback.md"
@@ -44,7 +88,7 @@ class WaitTests(unittest.TestCase):
 
     def run_wait(self, seconds=0, mode="empty"):
         return subprocess.run(
-            ["bash", str(self.script), str(self.feedback), str(seconds)],
+            [BASH, self.script.as_posix(), self.feedback.as_posix(), str(seconds)],
             env=dict(self.env, TEST_MODE=mode),
             capture_output=True,
             text=True,
@@ -93,7 +137,7 @@ class WaitTests(unittest.TestCase):
         # Older apps accept browser.feedback but reject notes.send, so the
         # mockup writes its fallback while the feedback request is still open.
         process = subprocess.Popen(
-            ["bash", str(self.script), str(self.feedback), "60"],
+            [BASH, self.script.as_posix(), self.feedback.as_posix(), "60"],
             env=dict(self.env, TEST_MODE="waiting"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -117,8 +161,7 @@ class WaitTests(unittest.TestCase):
             self.assertEqual(json.loads((self.root / "called").read_text()),
                              ["browser", "feedback", "--wait", "60"])
             self.assertEqual(Path(f"{self.feedback}.1").read_text(), stdout)
-            with self.assertRaises(ProcessLookupError):
-                os.kill(int(pid_file.read_text()), 0)
+            self.assertFalse(process_exists(int(pid_file.read_text())))
         finally:
             if process.poll() is None:
                 process.terminate()

@@ -6,15 +6,32 @@ run *args:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ "$(uname -s)" != Darwin ]; then
-        exec cargo run --locked --release -p herdr-gpui --features qa-menu -- {{args}}
+        # The app starts chats with the herdr-acp, finds the automation
+        # daemon, and starts Remote control with the herdr-remote-control, all beside
+        # its own executable.
+        cargo build --locked --release -p herdr-acp -p herdr-automate -p herdr-remote-control
+        exec cargo run --locked --release -p herdr-gpui -- {{args}}
     fi
-    {{just_executable()}} bundle release qa-menu
-    exec target/release/Herdr.app/Contents/MacOS/Herdr {{args}}
+    {{just_executable()}} bundle release
+    # Open the bundle instead of executing its binary: macOS asks for Local
+    # Network access (Bonjour, SSH hosts on the LAN) only for an app it
+    # launched, and denies a binary started from a shell without asking.
+    # Output still reaches this terminal; Ctrl-C quits the app.
+    app="$PWD/target/release/Herdr.app"
+    out=/dev/null
+    if [ -t 0 ]; then out=$(tty); fi
+    env_args=()
+    while IFS= read -r variable; do
+        env_args+=(--env "$variable")
+    done < <(env | grep -E '^(RUST_LOG|RUST_BACKTRACE|HERDR_[A-Z0-9_]*)=' || true)
+    trap 'pkill -f "^$app/Contents/MacOS/Herdr" || true' INT TERM
+    open -n -W --stdout "$out" --stderr "$out" ${env_args[@]+"${env_args[@]}"} "$app" --args {{args}}
 
 run-debug *args:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ "$(uname -s)" != Darwin ]; then
+        cargo build --locked -p herdr-acp -p herdr-automate -p herdr-remote-control
         exec cargo run --locked -p herdr-gpui -- {{args}}
     fi
     {{just_executable()}} bundle debug
@@ -36,6 +53,12 @@ test:
     cargo test --locked --workspace
     cargo test --locked --workspace --all-features
 
+# The same suites under cargo-nextest, a process per test (see .config/nextest.toml).
+# Doctests do not run here; `just test` remains the CI gate.
+nextest *args:
+    cargo nextest run --locked --workspace {{args}}
+    cargo nextest run --locked --workspace --all-features {{args}}
+
 # Explicit opt-in: launches and cleans up its own isolated daemon only.
 test-live binary:
     HERDR_TEST_BINARY="{{binary}}" cargo test --locked -p herdr-client --test live -- --ignored --nocapture
@@ -47,12 +70,12 @@ test-gui binary:
 # Explicit opt-in: reads the real code signature and Homebrew records of an
 # installed app. Never discovers an installation on its own.
 test-update bundle:
-    HERDR_TEST_BUNDLE="{{bundle}}" cargo test --locked -p herdr-gpui updater::install::tests::signing::installed_bundle -- --ignored --nocapture
-    HERDR_TEST_BUNDLE="{{bundle}}" cargo test --locked -p herdr-gpui updater::brew::tests::the_real_cask -- --ignored --nocapture
+    HERDR_TEST_BUNDLE="{{bundle}}" cargo test --locked -p herdr-updater install::tests::signing::installed_bundle -- --ignored --nocapture
+    HERDR_TEST_BUNDLE="{{bundle}}" cargo test --locked -p herdr-updater brew::tests::the_real_cask -- --ignored --nocapture
 
 # Really upgrades the installed app through Homebrew; restart it afterwards.
 test-brew-upgrade bundle expected:
-    HERDR_TEST_BUNDLE="{{bundle}}" HERDR_TEST_BREW_EXPECTED="{{expected}}" HERDR_TEST_BREW_UPGRADE=1 cargo test --locked -p herdr-gpui updater::brew::tests::homebrew_really_installs -- --ignored --nocapture
+    HERDR_TEST_BUNDLE="{{bundle}}" HERDR_TEST_BREW_EXPECTED="{{expected}}" HERDR_TEST_BREW_UPGRADE=1 cargo test --locked -p herdr-updater brew::tests::homebrew_really_installs -- --ignored --nocapture
 
 # Repeat the Linux suite under CPU pressure in a container, where scheduling
 # races reproduce that a fast machine hides. Needs Docker; nothing else.
@@ -70,7 +93,7 @@ test-perf budget="30":
 
 # Compare UI variants written as GPUI code in `file` (the built-in demo when
 # empty) in a native window. "Send to agent" types the notes into the calling
-# Herdr pane through the running Herdr GPUI, else writes `feedback`; `capture` gets
+# Herdr pane through the running Herdr UI, else writes `feedback`; `capture` gets
 # a PNG of the window once it has drawn. Debug build, no daemon. The process
 # left running is the app itself, so its PID is the one to stop.
 # See .claude/skills/gpui-mockup.
@@ -89,29 +112,43 @@ mockup file="" feedback="" capture="":
     exec target/debug/herdr-gpui "${args[@]}"
 
 build-release:
-    cargo build --locked --release -p herdr-gpui
+    cargo build --locked --release -p herdr-gpui -p herdr-acp -p herdr-automate -p herdr-remote-control
 
 # Compile and install the release executable into Cargo's bin directory.
 [unix]
 install:
     cargo install --locked --force --path crates/herdr-gpui --bin herdr-gpui
+    cargo install --locked --force --path crates/herdr-acp
+    cargo install --locked --force --path crates/herdr-automate
+    cargo install --locked --force --path crates/herdr-remote-control
 
 # Only installation bypasses the POSIX shell used by the other recipes.
 [windows]
 [extension(".cmd")]
 install:
     #!cmd.exe /c
-    cargo install --locked --force --path crates/herdr-gpui --bin herdr-gpui
+    cargo install --locked --force --path crates/herdr-gpui --bin herdr-gpui || exit /b 1
+    cargo install --locked --force --path crates/herdr-gpui-launcher || exit /b 1
+    cargo install --locked --force --path crates/herdr-acp || exit /b 1
+    cargo install --locked --force --path crates/herdr-automate || exit /b 1
+    cargo install --locked --force --path crates/herdr-remote-control
 
 # Regenerate circular Linux artwork on any platform (Python standard library).
 icons-linux:
     python3 scripts/generate-linux-icons.py
 
+# Regenerate the Windows executable icons and the installer's images (Python
+# standard library and rsvg-convert).
+icons-windows:
+    python3 scripts/generate-windows-icons.py
+    python3 scripts/generate-installer-images.py
+
 # Regenerate all checked-in artwork on macOS (requires brew install librsvg).
-icons: icons-linux
+icons: icons-linux icons-windows
     swift scripts/generate-icons.swift
 
-# Local, unsigned GUI-only bundle. Never installs or packages a daemon.
+# Local, unsigned bundle with the automation daemon's binary beside the app.
+# Never installs or starts a daemon.
 bundle profile="release" features="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -123,8 +160,21 @@ bundle profile="release" features="":
     esac
     app=target/{{profile}}/Herdr.app
     cargo build --locked $flags --target-dir target -p herdr-gpui --features "{{features}}"
+    cargo build --locked $flags --target-dir target -p herdr-acp -p herdr-automate -p herdr-remote-control
     mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+    # Replace the executables rather than rewrite them in place: macOS keeps
+    # a signed file's old signature with its inode, so reading the rewritten
+    # pages kills the reader, and a chat still running the old herdr-acp
+    # keeps its own copy.
+    rm -f "$app/Contents/MacOS/Herdr" "$app/Contents/MacOS/herdr-acp" "$app/Contents/MacOS/herdr-automate" "$app/Contents/MacOS/herdr-remote-control"
     cp target/{{profile}}/herdr-gpui "$app/Contents/MacOS/Herdr"
+    # The automation daemon, found beside the app's executable.
+    cp target/{{profile}}/herdr-automate "$app/Contents/MacOS/herdr-automate"
+    codesign --force --sign - "$app/Contents/MacOS/herdr-automate"
+    # Chats the app starts run the herdr-acp beside its executable.
+    cp target/{{profile}}/herdr-acp "$app/Contents/MacOS/herdr-acp"
+    # Remote control runs the herdr-remote-control beside it as a user service.
+    cp target/{{profile}}/herdr-remote-control "$app/Contents/MacOS/herdr-remote-control"
     cp assets/macos/Info.plist "$app/Contents/Info.plist"
     # LaunchServices and the Dock cache icons by bundle ID, so every worktree
     # build sharing the release ID competed with the installed app's icon.
@@ -147,10 +197,32 @@ test-build: build-release
 check-file-size:
     bash scripts/check-file-size.sh
 
+# Fail when a `keep-sorted start`/`end` region is out of order.
+check-sorted:
+    python3 scripts/test_check_sorted.py
+    python3 scripts/check-sorted.py
+
+# Sort every `keep-sorted start`/`end` region in place.
+sort:
+    python3 scripts/check-sorted.py --fix
+
+# Compile the remote control web app's stylesheet (commit the result) with
+# the Tailwind standalone CLI v4, so building the crate needs no Node.
+web-css:
+    tailwindcss --input crates/herdr-remote-control/src/web/assets/input.css --output crates/herdr-remote-control/src/web/assets/app.css --minify
+
 test-mockup-wait:
     python3 .claude/skills/gpui-mockup/scripts/test_wait.py
 
-ci: format-check check-file-size lint test test-mockup-wait
+test-pr-closure:
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_close_low_confidence_prs.py
+
+ci: format-check check-file-size check-sorted lint test test-mockup-wait test-pr-closure
+
+# Tools are listed in scripts/setup-ci.sh; Docker for lint-linux is only checked.
+# Install the tools local CI-equivalent runs need, on macOS or Ubuntu.
+setup-ci:
+    bash scripts/setup-ci.sh
 
 # Cross type-check the Windows target without a Windows machine. CI lints the
 # MSVC target on a Windows runner; this uses the GNU target because a Mac or
@@ -194,10 +266,15 @@ verify-release *args:
 check-commits base="origin/main":
     python3 scripts/release/check-commit-messages.py range "{{base}}..HEAD"
 
-# Install the commit-msg hook for this checkout and every worktree of it.
+# Install the hooks, and the merge settings that cut repeated conflict work,
+# for this checkout and every worktree of it.
 hooks:
     git config core.hooksPath .githooks
-    @echo "core.hooksPath = .githooks"
+    git config rerere.enabled true
+    git config rerere.autoupdate true
+    git config merge.cargo-lock.name "Cargo.lock: keep one side, then rebuild with Cargo"
+    git config merge.cargo-lock.driver "bash scripts/git/merge-cargo-lock.sh %O %A %B"
+    @echo "Hooks, rerere, and the Cargo.lock merge driver are configured."
 
 # What changed since the last release tag, straight from git history.
 changelog-unreleased:
@@ -208,8 +285,19 @@ changelog:
     git-cliff --config cliff.toml
 
 # Exactly what a release would publish: CHANGELOG.md and RELEASE_NOTES.md.
+# Windows counts as signed once WINDOWS_SIGNING_SUBJECT is set, as in
+# release.yml; set WINDOWS_SIGNED=true or false to preview either without gh.
 changelog-release version output:
-    bash scripts/release/generate-changelog.sh "{{version}}" "{{output}}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z ${WINDOWS_SIGNED:-} ]]; then
+        if [[ -n $(gh variable get WINDOWS_SIGNING_SUBJECT --repo penso/herdr-gpui 2>/dev/null) ]]; then
+            WINDOWS_SIGNED=true
+        else
+            WINDOWS_SIGNED=false
+        fi
+    fi
+    WINDOWS_SIGNED=$WINDOWS_SIGNED bash scripts/release/generate-changelog.sh "{{version}}" "{{output}}"
 
 # Owner-only remote release; CI derives the YYYYMMDD.COUNTER version itself.
 release:

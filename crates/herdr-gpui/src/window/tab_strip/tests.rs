@@ -62,16 +62,32 @@ fn zoomed_tab_shows_its_mark_within_its_width(cx: &mut TestAppContext) {
     assert!((mark.center().y - tab.center().y).abs() <= px(0.5));
     let (zoomed, unzoomed) = cx.update(|window, cx| {
         let view = view.read(cx);
-        let indicators = Indicators::new(None, false, &view.theme);
+        let indicators = Indicators::new(
+            None,
+            crate::config::StatusIcons::default(),
+            false,
+            false,
+            &view.theme,
+        );
         let label = view.live.snapshot.as_ref().unwrap().tabs[0].label.clone();
-        let lead = Lead::of(view.live.snapshot.as_ref().unwrap().tabs[0].agent_status);
+        let snapshot = view.live.snapshot.as_ref().unwrap();
+        let lead = herdr_mark(snapshot, &snapshot.tabs[0]).lead();
         (
-            view.tab_width(&label.clone().into(), lead, true, indicators, window),
-            view.tab_width(&label.into(), lead, false, indicators, window),
+            view.tab_width(&label.clone().into(), shape(lead, true), indicators, window),
+            view.tab_width(&label.into(), shape(lead, false), indicators, window),
         )
     });
     assert_eq!(zoomed - unzoomed, DOT_GAP + ZOOM_ICON);
     assert!((tab.size.width - px(zoomed)).abs() <= px(0.5), "{tab:?}");
+}
+
+/// A tab the strip does not show, for the classic layout's measure.
+fn shape(lead: Lead, zoomed: bool) -> TabShape {
+    TabShape {
+        lead,
+        zoomed,
+        selected: false,
+    }
 }
 
 fn status_layout(cx: &mut TestAppContext, settings: Option<&str>, font_size: f32) {
@@ -108,6 +124,8 @@ fn status_layout(cx: &mut TestAppContext, settings: Option<&str>, font_size: f32
         let view = view.read(cx);
         let indicators = Indicators::new(
             view.settings.shared.as_ref(),
+            view.config.status_icons,
+            view.config.edge_rail,
             matches!(
                 cx.window_appearance(),
                 WindowAppearance::Light | WindowAppearance::VibrantLight
@@ -116,7 +134,12 @@ fn status_layout(cx: &mut TestAppContext, settings: Option<&str>, font_size: f32
         );
         (
             indicators.width(&view.config.tabs),
-            view.tab_width(&label.into(), Lead::Status, false, indicators, window),
+            view.tab_width(
+                &label.into(),
+                shape(Lead::Status, false),
+                indicators,
+                window,
+            ),
         )
     });
     assert_eq!(dot.size.width, px(width));
@@ -429,8 +452,8 @@ fn holding_a_tab_lifts_it_bigger_and_a_release_picks_the_gap(cx: &mut TestAppCon
     assert!((passed.left() - a.left()).abs() <= px(0.5), "{passed:?}");
     assert_eq!(cx.debug_bounds("tab-c").unwrap(), c);
 
-    // Carried past the last tab, it lands after it.
-    let end = point(a.center().x + px(2000.), a.center().y);
+    // Carried past the last tab, still in the window, it lands after it.
+    let end = point(px(1590.), a.center().y);
     for _ in 0..2 {
         cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
         draw(cx);
@@ -464,16 +487,21 @@ fn holding_a_tab_lifts_it_bigger_and_a_release_picks_the_gap(cx: &mut TestAppCon
 fn tabs_stay_put_when_the_daemon_cannot_move_them(cx: &mut TestAppContext) {
     let (view, cx) = four_tabs(cx, false);
     let a = cx.debug_bounds("tab-a").unwrap();
+    let b = cx.debug_bounds("tab-b").unwrap();
+    // It lifts, as it can still be carried out of the window, but takes no
+    // place in its strip, so the tabs it passes stay put.
     cx.simulate_mouse_down(a.center(), MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_move(
-        a.center() + point(px(200.), px(0.)),
-        MouseButton::Left,
-        Modifiers::default(),
-    );
+    let along = a.center() + point(px(200.), px(0.));
+    for _ in 0..2 {
+        cx.simulate_mouse_move(along, MouseButton::Left, Modifiers::default());
+        draw(cx);
+    }
+    assert_eq!(target(&view, cx), None);
+    assert_eq!(cx.debug_bounds("tab-b").unwrap(), b);
+    cx.simulate_mouse_up(along, MouseButton::Left, Modifiers::default());
     draw(cx);
     view.read_with(cx, |view, _| assert!(view.tab_drag.is_none()));
     assert_eq!(cx.debug_bounds("tab-a").unwrap(), a);
-    cx.simulate_mouse_up(a.center(), MouseButton::Left, Modifiers::default());
 }
 
 #[gpui::test]
@@ -619,4 +647,18 @@ fn a_bottom_strip_still_reorders_by_dragging(cx: &mut TestAppContext) {
 }
 
 /// A chosen page's tab stays in view as its title comes in.
+mod group_drop;
 mod page_title;
+mod tear_off;
+
+/// The dividers between groups, and the grips that drag them.
+mod divider;
+
+/// Every tab layout draws its tabs as wide as the strip measures them.
+mod layouts;
+
+/// The curved layout's sliding body and the card it flows into.
+mod curved;
+
+/// Where the agent buttons draw, and what a click on one starts.
+mod launcher;

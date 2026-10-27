@@ -95,8 +95,24 @@ fn tailscale_status_without_peers_or_with_bad_json() {
     assert!(tailscale::parse(b"{}").unwrap().is_empty());
     assert!(matches!(
         tailscale::parse(b"Warning: not json"),
-        Err(Error::TailscaleJson(_))
+        Err(Error::Devices(crate::menu::devices::Error::TailscaleJson(
+            _
+        )))
     ));
+}
+
+#[test]
+fn tailscale_switched_off_suggests_nothing() {
+    for state in ["Stopped", "NeedsLogin", "NoState", "Starting"] {
+        let json = STATUS.replace(
+            r#""BackendState": "Running""#,
+            &format!(r#""BackendState": "{state}""#),
+        );
+        assert!(
+            tailscale::parse(json.as_bytes()).unwrap().is_empty(),
+            "{state}"
+        );
+    }
 }
 
 #[test]

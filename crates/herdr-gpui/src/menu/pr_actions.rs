@@ -17,7 +17,7 @@ impl HerdrWindow {
     pub(super) fn update_pr_actions(&mut self, now: Instant) -> bool {
         let target = self
             .git_open_pull_request()
-            .and_then(|pr| Target::try_from(pr).ok());
+            .and_then(|pr| Target::try_from(&*pr).ok());
         self.pr_actions.track(target);
         let mut changed = self.pr_actions.poll();
         if self.pr_actions.take_settled() {
@@ -32,8 +32,13 @@ impl HerdrWindow {
         changed
     }
 
-    fn pr_token(&self) -> Option<std::sync::Arc<secrecy::SecretString>> {
-        self.pr_profile().map(|profile| profile.token.clone())
+    /// The token that reads the followed pull request's repository.
+    pub(crate) fn pr_token(&self) -> Option<std::sync::Arc<secrecy::SecretString>> {
+        let tokens = self.pr_tokens()?;
+        Some(match self.pr_actions.target() {
+            Some(target) => tokens.for_owner(&target.owner).clone(),
+            None => tokens.main().clone(),
+        })
     }
 
     pub(super) fn open_pr_review(&mut self) {
@@ -41,7 +46,7 @@ impl HerdrWindow {
         self.menu.error = None;
         let result = self
             .pr_token()
-            .ok_or(crate::Error::GitHubAuthentication)
+            .ok_or(herdr_github::Error::Authentication)
             .and_then(|token| self.pr_actions.load_comments(token));
         if let Err(error) = result {
             self.menu.error = Some(error.to_string());
@@ -82,7 +87,7 @@ impl HerdrWindow {
             .unwrap_or_default();
         let result = self
             .pr_token()
-            .ok_or(crate::Error::GitHubAuthentication)
+            .ok_or(herdr_github::Error::Authentication)
             .and_then(|token| self.pr_actions.start(Action::Comment(body), &[], token));
         match result {
             Ok(()) => {
@@ -98,20 +103,24 @@ impl HerdrWindow {
     /// The confirmation itself: only this button, or Enter on this dialog,
     /// sends a merge, and only for the head the dialog was opened with.
     pub(super) fn submit_pr_merge(&mut self, cx: &mut Context<Self>) {
-        let result = (|| {
-            let method = self.menu.merge_method.ok_or(crate::Error::PrMergeMethod)?;
+        let result = (|| -> crate::Result<()> {
+            let method = self
+                .menu
+                .merge_method
+                .ok_or(herdr_github::pr_actions::Error::MergeMethod)?;
             if self.menu.merge_target.is_none()
                 || self.menu.merge_target.as_ref() != self.pr_actions.target()
             {
-                return Err(crate::Error::PrMergeChanged);
+                return Err(herdr_github::pr_actions::Error::MergeChanged.into());
             }
             let allowed = self
                 .git_open_pull_request()
                 .map(|pr| pr.merge_methods.clone())
                 .unwrap_or_default();
-            let token = self.pr_token().ok_or(crate::Error::GitHubAuthentication)?;
-            self.pr_actions
-                .start(Action::Merge(method), &allowed, token)
+            let token = self.pr_token().ok_or(herdr_github::Error::Authentication)?;
+            Ok(self
+                .pr_actions
+                .start(Action::Merge(method), &allowed, token)?)
         })();
         match result {
             Ok(()) => {
@@ -324,7 +333,7 @@ impl HerdrWindow {
         };
         body = body.child(heading("Checks"));
         let pr = self.git_open_pull_request();
-        let mut checks = pr.into_iter().flat_map(|pr| pr.check_list()).peekable();
+        let mut checks = pr.iter().flat_map(|pr| pr.check_list()).peekable();
         if checks.peek().is_none() {
             body = body.child(
                 div()
@@ -385,7 +394,7 @@ impl HerdrWindow {
             if comments.is_empty() {
                 body = body.child(div().text_color(rgb(theme.muted)).child("No comments yet"));
             }
-            for comment in comments {
+            for comment in comments.iter() {
                 body = body.child(
                     div()
                         .debug_selector(|| "pr-review-comment".into())

@@ -11,6 +11,8 @@ use herdr_client::protocol::{
 };
 use std::sync::Arc;
 
+mod idle_reassert;
+mod padding;
 mod titlebar_navigation;
 
 /// A coherent surface for `snapshot`, as the daemon projects one.
@@ -104,7 +106,7 @@ fn a_parked_connection_stays_unfocused_and_asks_for_its_tab_once() {
         snapshot,
     );
     let now = Instant::now();
-    parked.steer("w1:t2", now);
+    parked.steer("w1:t2", now, None);
     assert_eq!(
         peer.receive(),
         ClientMessage::ClientShellFocus { focused: false }
@@ -117,11 +119,15 @@ fn a_parked_connection_stays_unfocused_and_asks_for_its_tab_once() {
     assert_eq!(request["params"]["tab_id"], "w1:t2");
     // Neither is repeated while the request is fresh; a later tick asks
     // again only once it has had its time.
-    parked.steer("w1:t2", now + Duration::from_millis(10));
+    parked.steer("w1:t2", now + Duration::from_millis(10), None);
     assert!(parked.unfocused);
     let asked = parked.asked.clone().unwrap();
     assert_eq!((asked.0.as_str(), asked.1), ("w1:t2", now));
-    parked.steer("w1:t2", now + REFOCUS_AFTER + Duration::from_millis(10));
+    parked.steer(
+        "w1:t2",
+        now + REFOCUS_AFTER + Duration::from_millis(10),
+        None,
+    );
     assert!(parked.asked.unwrap().1 > now);
 }
 
@@ -142,15 +148,15 @@ fn a_parked_connection_settles_a_new_size_before_sending_it() {
     let now = Instant::now();
     parked.options.surface_size.cols = 100;
     // Already on its tab, it asks for nothing but a size.
-    parked.steer(&tab, now);
+    parked.steer(&tab, now, None);
     assert_eq!(
         peer.receive(),
         ClientMessage::ClientShellFocus { focused: false }
     );
     assert!(parked.pending_resize.is_some() && parked.asked.is_none());
-    parked.steer(&tab, now + Duration::from_millis(100));
+    parked.steer(&tab, now + Duration::from_millis(100), None);
     assert!(parked.last_queued_options != Some(parked.options));
-    parked.steer(&tab, now + RESIZE_SETTLE + Duration::from_millis(10));
+    parked.steer(&tab, now + RESIZE_SETTLE + Duration::from_millis(10), None);
     let ClientMessage::ClientShellResize { surface_size, .. } = peer.receive() else {
         panic!("expected a resize");
     };
@@ -179,18 +185,26 @@ fn a_parked_connection_reasks_a_size_another_client_overrode() {
     parked.options.surface_size.cols = 100;
     parked.last_queued_options = Some(parked.options);
     let now = Instant::now();
-    parked.steer(&tab, now);
+    parked.steer(&tab, now, Some(now));
     assert_eq!(
         peer.receive(),
         ClientMessage::ClientShellFocus { focused: false }
     );
     assert!(parked.pending_resize.is_some());
-    parked.steer(&tab, now + RESIZE_SETTLE + Duration::from_millis(10));
+    parked.steer(
+        &tab,
+        now + RESIZE_SETTLE + Duration::from_millis(10),
+        Some(now),
+    );
     assert!(
         parked.pending_resize.is_some(),
         "a frame of another size is not re-claimed before it has been answered"
     );
-    parked.steer(&tab, now + RESIZE_REASSERT + Duration::from_millis(10));
+    parked.steer(
+        &tab,
+        now + RESIZE_REASSERT + Duration::from_millis(10),
+        Some(now),
+    );
     let ClientMessage::ClientShellResize { surface_size, .. } = peer.receive() else {
         panic!("expected a resize");
     };
@@ -219,6 +233,16 @@ fn window(cx: &mut TestAppContext) -> (Entity<HerdrWindow>, &mut VisualTestConte
     })
 }
 
+/// After a split: `right` takes "t0", which the window's connection shows,
+/// with that connection, and is the group in use; `left` shows "t1".
+pub(crate) fn terminals_side_by_side(view: &mut HerdrWindow, left: GroupId, right: GroupId) {
+    let layout = view.ensure_layout().unwrap();
+    layout.show(right, Pick::Herdr("t0".into()));
+    layout.choose(left, Pick::Herdr("t1".into()));
+    layout.activate(right);
+    view.set_primary_group(right);
+}
+
 fn draw(cx: &mut VisualTestContext) {
     cx.update(|window, cx| full_draw(window, cx).clear(cx));
 }
@@ -237,16 +261,16 @@ fn using_a_parked_group_swaps_its_connection_in(cx: &mut TestAppContext) {
         let slots = view.group_slots();
         [slots[0].id, slots[1].id]
     });
-    view.read_with(cx, |view, _| assert_eq!(view.primary_group(), Some(right)));
+    // The split moves no tab and leaves the connection where it was.
+    view.read_with(cx, |view, _| assert_eq!(view.primary_group(), Some(left)));
 
-    // The left group picks the other Herdr tab through a connection of
-    // its own, already on that tab.
+    // The right group takes the tab the window's connection shows, and the
+    // left one shows the other Herdr tab through a connection of its own,
+    // already on that tab.
     let peer = MockPeer::new();
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            let layout = view.ensure_layout().unwrap();
-            layout.choose(left, Pick::Herdr("t1".into()));
-            layout.activate(right);
+            terminals_side_by_side(view, left, right);
             let mut on_t1 = snapshot(40);
             on_t1.focused_workspace_id = Some("w0".into());
             on_t1.focused_tab_id = Some("t1".into());
@@ -337,10 +361,7 @@ fn leaving_the_workspace_drops_parked_connections(cx: &mut TestAppContext) {
             view.command(Command::SplitEditor, window, cx);
             let slots = view.group_slots();
             let key = view.browser_key().unwrap();
-            view.ensure_layout()
-                .unwrap()
-                .choose(slots[0].id, Pick::Herdr("t1".into()));
-            view.ensure_layout().unwrap().activate(slots[1].id);
+            terminals_side_by_side(view, slots[0].id, slots[1].id);
             let mut on_t1 = snapshot(40);
             on_t1.focused_workspace_id = Some("w0".into());
             on_t1.focused_tab_id = Some("t1".into());

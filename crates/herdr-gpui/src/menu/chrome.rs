@@ -4,13 +4,13 @@
 
 mod keys;
 
-use super::{MENU_MARGIN, Page, WorkspaceAction};
+use super::{MENU_MARGIN, Page, WorkspaceAction, devices::rail};
 use crate::{HerdrWindow, actions, fonts::StyledFont};
 use gpui::{prelude::*, *};
-use herdr_client::Method;
 
-/// How far past its panel a popover counts as covering, for the native pages
-/// that step aside for it.
+/// How far past its panel a popover counts as covering, for the Windows
+/// pages that hide under it.
+#[cfg(any(windows, test, feature = "integration-test"))]
 const COVER_MARGIN: f32 = 8.;
 
 impl HerdrWindow {
@@ -23,7 +23,6 @@ impl HerdrWindow {
 
     pub(crate) fn open_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.shift_taps.cancel();
-        self.finish_font_size_edit(true, cx);
         if !self.cancel_theme_preview(cx) {
             return false;
         }
@@ -41,7 +40,6 @@ impl HerdrWindow {
     }
 
     pub(crate) fn dismiss_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.finish_font_size_edit(true, cx);
         if !self.cancel_theme_preview(cx) {
             return;
         }
@@ -61,6 +59,11 @@ impl HerdrWindow {
             .application
             .as_ref()
             .and_then(|menu| menu.return_focus.clone());
+        // A page that animates out keeps what it reads from the reset.
+        if let Some(page) = self.menu.page.filter(|page| super::appear::leaves(*page)) {
+            let kept = super::appear::Kept::take(&mut self.menu);
+            self.menu.appear.keep(page, kept);
+        }
         self.menu.reset();
         self.apply_shared_theme(cx);
         window.focus(return_focus.as_ref().unwrap_or(&self.focus), cx);
@@ -83,19 +86,10 @@ impl HerdrWindow {
 
     /// Asks the selected daemon to reread its config file.
     pub(crate) fn reload_daemon_config(&mut self) {
-        if let (Some(handle), Some(snapshot)) = (
-            &self.endpoints[self.selected_endpoint].connection.handle,
-            &self.live.snapshot,
-        ) {
-            self.local_error = handle
-                .request(
-                    &snapshot.boot_id,
-                    Method::ServerReloadConfig,
-                    serde_json::json!({}),
-                )
-                .err()
-                .map(|error| format!("Reload config: {error}"));
-        }
+        self.local_error = self.endpoints[self.selected_endpoint]
+            .reload_config()
+            .err()
+            .map(|error| format!("Reload config: {error}"));
     }
 
     pub(super) fn menu_items(&self) -> Vec<&'static str> {
@@ -192,6 +186,7 @@ impl HerdrWindow {
                         .debug_selector(|| "session-picker-underlay".into()),
                     window.viewport_size(),
                     Page::Sessions,
+                    px(0.),
                 )
                 .overflow_y_scroll()
                 .p(px(6.))
@@ -211,23 +206,26 @@ impl HerdrWindow {
                 .absolute()
                 .inset_0()
                 .child(picker)
-                .child(self.render_menu_layer(window, cx));
+                .child(self.render_menu_layer(
+                    self.menu.page.unwrap_or(Page::Menu),
+                    None,
+                    window,
+                    cx,
+                ));
         }
-        self.render_menu_layer(window, cx)
+        self.render_menu_layer(self.menu.page.unwrap_or(Page::Menu), None, window, cx)
     }
 
+    /// Places a footer menu beside its anchor, `lift` short of it while it
+    /// slides into place.
     fn anchor_footer_panel(
         &self,
         panel: Stateful<Div>,
         viewport: Size<Pixels>,
         page: Page,
+        lift: Pixels,
     ) -> Stateful<Div> {
-        let chrome = px(crate::titlebar::HEIGHT
-            + crate::worktree_banner::reserved(env!("HERDR_BUILD_WORKTREE") == "1"));
-        let band = (viewport.height - chrome - px(2. * MENU_MARGIN)).max(px(60.));
-        let room = |side: Pixels| side.clamp(px(0.), band).max(px(60.)).min(band);
-        let above = room(self.menu.anchor.y - px(12. + MENU_MARGIN) - chrome);
-        let below = room(viewport.height - self.menu.anchor.y - px(12. + MENU_MARGIN));
+        let (room, above) = self.footer_room(viewport);
         let list = matches!(page, Page::Devices | Page::Sessions);
         let width = if list {
             super::devices::MENU_WIDTH
@@ -247,16 +245,32 @@ impl HerdrWindow {
             .absolute()
             .left(left)
             .w(px(width).min((viewport.width - px(16.)).max(px(0.))));
-        if above >= below {
+        if above {
             panel
                 .bottom(
                     (viewport.height - self.menu.anchor.y
                         + px(if list { super::devices::MENU_GAP } else { 12. }))
-                    .max(px(MENU_MARGIN)),
+                    .max(px(MENU_MARGIN))
+                        - lift,
                 )
-                .max_h(above)
+                .max_h(room)
         } else {
-            panel.top(self.menu.anchor.y + px(12.)).max_h(below)
+            panel.top(self.menu.anchor.y + px(12.) - lift).max_h(room)
+        }
+    }
+
+    /// The room a footer menu has, and whether it opens above its anchor,
+    /// as it does from the sidebar footer at the window's foot.
+    fn footer_room(&self, viewport: Size<Pixels>) -> (Pixels, bool) {
+        let chrome = px(crate::titlebar::HEIGHT);
+        let band = (viewport.height - chrome - px(2. * MENU_MARGIN)).max(px(60.));
+        let room = |side: Pixels| side.clamp(px(0.), band).max(px(60.)).min(band);
+        let above = room(self.menu.anchor.y - px(12. + MENU_MARGIN) - chrome);
+        let below = room(viewport.height - self.menu.anchor.y - px(12. + MENU_MARGIN));
+        if above >= below {
+            (above, true)
+        } else {
+            (below, false)
         }
     }
 
@@ -274,12 +288,23 @@ impl HerdrWindow {
             && !page.pointer_anchored()
     }
 
-    fn render_menu_layer(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
-        let page = self.menu.page.unwrap_or(Page::Menu);
+    /// Draws `page`: the open menu, or with `leaving` the one that just
+    /// closed, still showing that much of itself as it goes.
+    pub(super) fn render_menu_layer(
+        &self,
+        page: Page,
+        leaving: Option<f32>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let font = &self.config.ui;
         let theme = &self.theme;
         let viewport = window.viewport_size();
         let session_modal = page == Page::Sessions && self.menu.session_edit.is_some();
+        // Add Device's sources share one wide dialog; a narrow window keeps
+        // the rail to icons so the form still has room.
+        let add_device = rail::Source::of(page).is_some();
+        let compact_rail = viewport.width - px(32.) < px(rail::COMPACT_BELOW * (font.size / 12.));
         let footer_anchored =
             matches!(page, Page::Menu | Page::Devices | Page::Sessions) && !session_modal;
         // A GitHub tab of the new worktree dialog is a picker, not a form.
@@ -292,6 +317,11 @@ impl HerdrWindow {
         // modal decision, not a continuation of the row it came from, so it
         // centres over a dimmed window the way the Herdr TUI's dialogs do.
         let pointer_anchored = page.pointer_anchored();
+        let dims = self.menu_dims();
+        let now = crate::motion::now();
+        let shown = leaving.unwrap_or_else(|| self.menu.appear.panel(now));
+        let lift = super::appear::Appear::offset(dims, shown);
+        let rises = page == Page::Devices;
         let mut panel = div()
             .id("menu-panel")
             .debug_selector(|| "menu-panel".into())
@@ -324,14 +354,38 @@ impl HerdrWindow {
                     // Lift the popup off the terminal behind it, as the pickers do.
                     .shadow_lg()
             })
-            .when(footer_anchored, |panel| {
-                self.anchor_footer_panel(panel, viewport, page)
+            // All Devices rises out of the footer that opened it, so a box in
+            // its place clips it on the way; see the end of this function.
+            .when(footer_anchored && !rises, |panel| {
+                self.anchor_footer_panel(panel, viewport, page, lift)
+            })
+            .when(rises, |panel| {
+                let (room, above) = self.footer_room(viewport);
+                let below = 1. - shown;
+                // Its own height, as the last frame laid it out; the box it
+                // rises in takes its height from it, so a share of that box
+                // would be a share of nothing. Until a frame has measured it,
+                // the room it may take keeps it out of sight.
+                let height = self.menu.appear.rise_height.get().unwrap_or(room);
+                let offset = height * below;
+                let measured = self.menu.appear.rise_height.clone();
+                panel
+                    .w_full()
+                    .max_h(room)
+                    .top(if above { offset } else { -offset })
+                    .child(
+                        canvas(
+                            move |bounds, _, _| measured.set(Some(bounds.size.height)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
             })
             .when(matches!(page, Page::Usage(_)), |panel| {
                 // Rises from the status bar segment that opened it, kept inside
                 // the window and clear of the titlebar.
-                let chrome = px(crate::titlebar::HEIGHT
-                    + crate::worktree_banner::reserved(env!("HERDR_BUILD_WORKTREE") == "1"));
+                let chrome = px(crate::titlebar::HEIGHT);
                 let width = px(crate::usage::PANEL_WIDTH)
                     .min((viewport.width - px(2. * MENU_MARGIN)).max(px(0.)));
                 panel
@@ -343,7 +397,7 @@ impl HerdrWindow {
                             .min(viewport.width - width - px(MENU_MARGIN))
                             .max(px(MENU_MARGIN)),
                     )
-                    .bottom((viewport.height - self.menu.anchor.y).max(px(MENU_MARGIN)))
+                    .bottom((viewport.height - self.menu.anchor.y).max(px(MENU_MARGIN)) - lift)
                     .w(width)
                     .max_h((self.menu.anchor.y - chrome - px(MENU_MARGIN)).max(px(60.)))
                     .flex()
@@ -363,11 +417,7 @@ impl HerdrWindow {
                             .min(px(if page == Page::Git { 340. } else { 420. })))
                         .max_h((viewport.height - px(24.)).max(px(0.)))
                         .when(page == Page::Git, |panel| {
-                            let top = crate::titlebar::HEIGHT
-                                + crate::worktree_banner::reserved(
-                                    env!("HERDR_BUILD_WORKTREE") == "1",
-                                )
-                                + 6.;
+                            let top = crate::titlebar::HEIGHT + 6.;
                             panel
                                 .max_h((viewport.height - px(top + 12.)).max(px(0.)))
                                 .shadow_lg()
@@ -381,9 +431,12 @@ impl HerdrWindow {
                     page,
                     Page::Tab
                         | Page::RenameTab
+                        | Page::MoveTab
                         | Page::Group
                         | Page::Pane
                         | Page::RenamePane
+                        | Page::MovePane
+                        | Page::CarryPane
                         | Page::PaneProcesses
                         | Page::KillProcesses
                         | Page::Host
@@ -408,7 +461,7 @@ impl HerdrWindow {
                         } else if page == Page::PaneProcesses {
                             // Name, command, pid, CPU and memory columns.
                             560.
-                        } else if page == Page::Group {
+                        } else if matches!(page, Page::Group | Page::MovePane | Page::MoveTab) {
                             240.
                         } else {
                             360.
@@ -423,13 +476,19 @@ impl HerdrWindow {
                     && !matches!(page, Page::Dialog(_)),
                 |panel| {
                     panel
-                        .w((viewport.width - px(32.)).max(px(0.)).min(px(
-                            if page == Page::Preferences {
-                                620. * (font.size / 12.)
+                        .w((viewport.width - px(32.))
+                            .max(px(0.))
+                            .min(px(if add_device {
+                                rail::WIDTH * (font.size / 12.)
+                            } else if page == Page::Palette && self.palette_previews(viewport) {
+                                // Room for Go To's list beside its preview.
+                                1120. * (font.size / 12.)
+                            } else if page == Page::Palette {
+                                // Wide like Raycast, so the query leads the panel.
+                                720. * (font.size / 12.)
                             } else {
                                 480.
-                            },
-                        )))
+                            })))
                         .max_h((viewport.height - px(32.)).max(px(0.)))
                 },
             )
@@ -438,10 +497,9 @@ impl HerdrWindow {
                     page,
                     Page::Keybinds
                         | Page::Themes
-                        | Page::Fonts
+                        | Page::DeviceTheme
                         | Page::Palette
                         | Page::CodeSearch
-                        | Page::Preferences
                         | Page::AppUpdate
                         | Page::GitHub
                         | Page::AddDevice
@@ -469,10 +527,9 @@ impl HerdrWindow {
                     page,
                     Page::Keybinds
                         | Page::Themes
-                        | Page::Fonts
+                        | Page::DeviceTheme
                         | Page::Palette
                         | Page::CodeSearch
-                        | Page::Preferences
                 ),
                 |panel| {
                     panel
@@ -484,6 +541,17 @@ impl HerdrWindow {
                         .shadow_lg()
                 },
             )
+            .when(add_device, |panel| {
+                panel.h(px(rail::HEIGHT * (font.size / 12.))
+                    .min((viewport.height - px(32.)).max(px(0.))))
+            })
+            .when(page == Page::RemoteDevices, |panel| {
+                panel
+                    .w((viewport.width - px(24.))
+                        .max(px(0.))
+                        .min(px(crate::remote::MENU_WIDTH)))
+                    .shadow_lg()
+            })
             .when(page == Page::GitHub, |panel| {
                 panel
                     .w((viewport.width - px(32.)).max(px(0.)).min(px(400.)))
@@ -495,14 +563,24 @@ impl HerdrWindow {
             .when(
                 matches!(
                     page,
-                    Page::Install | Page::AgentSkill | Page::VersionMismatch
-                ),
+                    Page::Install
+                        | Page::AgentSkill
+                        | Page::VersionMismatch
+                        | Page::OpenCheckout
+                        | Page::OpenLink
+                ) || self.cloud_batch_open()
+                    || self.remote_dialog_open(),
                 |panel| {
                     panel
                         .w((viewport.width - px(24.)).max(px(0.)).min(px(420.)))
                         .max_h((viewport.height - px(24.)).max(px(0.)))
                 },
             )
+            .when(self.automation_dialog_open(), |panel| {
+                panel
+                    .w((viewport.width - px(24.)).max(px(0.)).min(px(560.)))
+                    .max_h((viewport.height - px(24.)).max(px(0.)))
+            })
             .when(
                 matches!(
                     page,
@@ -525,6 +603,13 @@ impl HerdrWindow {
             .text_font(font)
             .text_size(px(font.size))
             .line_height(px(font.line_height()))
+            .when(!rises, |panel| panel.opacity(shown))
+            // A popover drops from the pointer that opened it; a dialog rises.
+            // Footer and usage panels have slid already, by their own edge.
+            .when(
+                !footer_anchored && !matches!(page, Page::Usage(_)),
+                |panel| panel.top(if dims { lift } else { -lift }),
+            )
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -545,6 +630,11 @@ impl HerdrWindow {
                     div()
                         .id(item)
                         .debug_selector(move || format!("menu-{item}"))
+                        .role(Role::MenuItem)
+                        .aria_label(item)
+                        .when(Some(index) == self.menu.selected, |row| {
+                            row.aria_active_descendant()
+                        })
                         .min_h(px(font.line_height() + 12.))
                         .px(px(8.))
                         .flex()
@@ -575,15 +665,17 @@ impl HerdrWindow {
         } else if let Page::Usage(provider) = page {
             panel = panel.child(self.render_usage_panel(provider, cx));
         } else if page == Page::AddDevice {
-            panel = panel.child(self.render_add_device(cx));
-        } else if let Some(dialog) = self.render_cloud_dialog(cx) {
+            panel = panel.child(self.render_add_device(compact_rail, cx));
+        } else if let Some(dialog) = self.render_cloud_dialog(compact_rail, cx) {
             panel = panel.child(dialog);
         } else if page == Page::AddWsl {
-            panel = panel.child(self.render_add_wsl(cx));
+            panel = panel.child(self.render_add_wsl(compact_rail, cx));
         } else if page == Page::RemoveWsl {
             panel = panel.child(self.render_remove_wsl(cx));
         } else if page == Page::GitHub {
             panel = panel.child(self.render_github_auth(cx));
+        } else if page == Page::RemoteDevices {
+            panel = panel.child(self.render_remote_menu(cx));
         } else if page == Page::Workspace {
             // The PR card's text width: the panel's inset and border, and the
             // card's own margin, border, and padding.
@@ -593,6 +685,8 @@ impl HerdrWindow {
             ));
         } else if let Page::Dialog(action) = page {
             panel = panel.child(self.render_workspace_dialog(action, cx));
+        } else if page == Page::CarryPane {
+            panel = panel.child(self.render_carry(cx));
         } else if page == Page::Teleport {
             panel = panel.child(self.render_teleport(cx));
         } else if page == Page::Checkpoints {
@@ -611,13 +705,21 @@ impl HerdrWindow {
             panel = panel.child(self.render_pr_merge(cx));
         } else if matches!(
             page,
-            Page::Host | Page::RenameDevice | Page::ForwardPort | Page::RemoveDevice
+            Page::Host
+                | Page::RenameDevice
+                | Page::ForwardPort
+                | Page::DeviceTheme
+                | Page::RemoveDevice
         ) {
             panel = panel.child(self.render_host_menu(cx));
+        } else if page == Page::MoveTab {
+            panel = self.render_tab_move_picker(panel, cx);
         } else if matches!(page, Page::Tab | Page::RenameTab) {
             panel = panel.child(self.render_tab_menu(cx));
         } else if page == Page::Group {
             panel = self.render_group_menu(panel, cx);
+        } else if page == Page::MovePane {
+            panel = self.render_move_picker(panel, cx);
         } else if matches!(
             page,
             Page::Pane | Page::RenamePane | Page::PaneProcesses | Page::KillProcesses
@@ -627,16 +729,12 @@ impl HerdrWindow {
             panel = panel.child(self.render_keybinds(cx));
         } else if page == Page::Themes {
             panel = panel.child(self.render_theme_picker(cx));
-        } else if page == Page::Fonts {
-            panel = panel.child(self.render_font_picker(cx));
         } else if page == Page::Palette {
-            panel = panel.child(self.render_palette(cx));
+            panel = panel.child(self.render_palette(viewport, cx));
         } else if page == Page::CodeSearch {
             panel = panel.child(self.render_code_search(cx));
         } else if page == Page::ConfirmClose {
             panel = panel.child(self.render_close_confirmation(cx));
-        } else if page == Page::Preferences {
-            panel = panel.child(self.render_preferences(cx));
         } else if page == Page::AppUpdate {
             panel = panel.child(self.render_app_update(window, cx));
         } else if page == Page::About {
@@ -647,6 +745,16 @@ impl HerdrWindow {
             panel = panel.child(self.render_version_mismatch(cx));
         } else if page == Page::WorktreeScript {
             panel = panel.child(self.render_worktree_script(cx));
+        } else if page == Page::OpenLink {
+            panel = panel.child(self.render_open_link(cx));
+        } else if let Some(body) = self.cloud_batch_page(cx) {
+            panel = panel.child(body);
+        } else if let Some(body) = self.automation_dialog_page(cx) {
+            panel = panel.child(body);
+        } else if let Some(body) = self.remote_page(cx) {
+            panel = panel.child(body);
+        } else if page == Page::OpenCheckout {
+            panel = panel.child(self.render_open_checkout(cx));
         } else if page == Page::Install {
             panel = panel
                 .child(div().p(px(8.)).child("Herdr must be installed"))
@@ -691,30 +799,86 @@ impl HerdrWindow {
         } else {
             panel = panel.child(self.render_release_notes(cx));
         }
-        // Pages sit above everything GPUI draws, so the menu says what it
-        // covers: a dimmed dialog covers the window, a popover its panel.
-        let dims = self.menu_dims();
-        let cover = self.menu.cover.clone();
-        if dims {
-            cover.set(super::state::Cover::All);
-        }
-        let panel = panel.when(!dims, |panel| {
-            panel.child(
-                canvas(
-                    // Laid out inside the panel's border; the margin takes in
-                    // the border and the start of its shadow.
-                    move |bounds, _, _| {
-                        cover.set(super::state::Cover::Panel(bounds.dilate(px(COVER_MARGIN))))
-                    },
-                    |_, _, _, _| {},
+        // On Windows pages sit above everything GPUI draws, so the menu says
+        // what it covers: a dimmed dialog covers the window, a popover its
+        // panel. Tests and native checks read it to find the menu.
+        #[cfg(any(windows, test, feature = "integration-test"))]
+        let panel = {
+            let cover = self.menu.cover.clone();
+            if dims {
+                cover.set(super::state::Cover::All);
+            }
+            // A menu on its way out no longer covers anything.
+            panel.when(!dims && leaving.is_none(), |panel| {
+                panel.child(
+                    canvas(
+                        // Laid out inside the panel's border; the margin takes
+                        // in the border and the start of its shadow.
+                        move |bounds, _, _| {
+                            cover.set(super::state::Cover::Panel(bounds.dilate(px(COVER_MARGIN))))
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
                 )
-                .absolute()
-                .inset_0(),
+            })
+        };
+        // On its way out it takes no clicks: what they would act on has
+        // already closed.
+        let panel = panel.when(leaving.is_some(), |panel| {
+            panel.child(
+                div()
+                    .id("menu-leaving-shield")
+                    .debug_selector(|| "menu-leaving-shield".into())
+                    .absolute()
+                    .inset_0()
+                    .occlude(),
             )
         });
+        let placed = if pointer_anchored {
+            let position = if page == Page::Git {
+                point(self.menu.anchor.x, px(crate::titlebar::HEIGHT + 6.))
+            } else {
+                self.menu.anchor
+            };
+            anchored()
+                .position(position)
+                // The "…" button sits at a strip's right end, so its menu
+                // hangs leftward from it, as an editor's does.
+                .when(matches!(page, Page::Group | Page::RemoteDevices), |menu| {
+                    menu.anchor(Anchor::TopRight)
+                })
+                .snap_to_window_with_margin(Edges::all(px(12.)))
+                .child(panel)
+                .into_any_element()
+        } else if rises {
+            self.anchor_footer_panel(
+                div().id("menu-rise").overflow_hidden(),
+                viewport,
+                page,
+                px(0.),
+            )
+            .child(panel)
+            .into_any_element()
+        } else {
+            panel.into_any_element()
+        };
+        if leaving.is_some() {
+            return div()
+                .id("menu-leaving")
+                .absolute()
+                .inset_0()
+                .when(dims, |layer| layer.flex().items_center().justify_center())
+                .child(placed);
+        }
         div()
             .id("menu-overlay")
             .debug_selector(|| "menu-overlay".into())
+            // Focus stays here while the popup is open, so this is the menu
+            // or dialog a screen reader announces.
+            .role(page.accessible_role())
+            .aria_label(page.accessible_name())
             .absolute()
             .top_0()
             .left_0()
@@ -725,7 +889,10 @@ impl HerdrWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba((theme.background << 8) | 0xb0))
+                    .bg(super::appear::backdrop(
+                        theme.background,
+                        self.menu.appear.backdrop(now),
+                    ))
             })
             .occlude()
             .track_focus(&self.menu.focus)
@@ -765,29 +932,6 @@ impl HerdrWindow {
                 }),
             )
             .on_key_down(cx.listener(Self::menu_key_down))
-            .child(if pointer_anchored {
-                let position = if page == Page::Git {
-                    point(
-                        self.menu.anchor.x,
-                        px(crate::titlebar::HEIGHT
-                            + crate::worktree_banner::reserved(
-                                env!("HERDR_BUILD_WORKTREE") == "1",
-                            )
-                            + 6.),
-                    )
-                } else {
-                    self.menu.anchor
-                };
-                anchored()
-                    .position(position)
-                    // The "…" button sits at a strip's right end, so its menu
-                    // hangs leftward from it, as an editor's does.
-                    .when(page == Page::Group, |menu| menu.anchor(Anchor::TopRight))
-                    .snap_to_window_with_margin(Edges::all(px(12.)))
-                    .child(panel)
-                    .into_any_element()
-            } else {
-                panel.into_any_element()
-            })
+            .child(placed)
     }
 }

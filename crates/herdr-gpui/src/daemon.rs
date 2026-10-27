@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
-use herdr_client::{ConnectTarget, Stream};
+mod error;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod warning;
+
+use herdr_client::{ConnectTarget, Stream};
 use std::{
     env, io,
     path::{Path, PathBuf},
@@ -13,6 +15,8 @@ use std::{
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use warning::LocalPeerWarning;
+
+pub(crate) use error::Error;
 
 pub(crate) enum LocalPeer {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -46,12 +50,13 @@ pub fn connect(
         Duration::from_secs(20),
         || {
             on_start();
-            let mut command = Command::new(executable());
+            let mut command = herdr_client::new_command(executable());
             if let ConnectTarget::Session { name, .. } = target {
                 command.args(["--session", name]);
             }
             command.arg("server");
             crate::login_env::apply(&mut command);
+            pin_config_home(&mut command, herdr_client::local_var("XDG_CONFIG_HOME"));
             command
         },
         matches!(
@@ -65,6 +70,17 @@ pub fn connect(
     )?;
     let local = local_peer(&stream, target, &socket);
     Ok((stream, local))
+}
+
+/// Start the daemon under the configuration root `socket` was resolved
+/// from, so the wait for it polls where it listens. The login environment can
+/// carry an `XDG_CONFIG_HOME` this app did not adopt, such as when a daemon
+/// answered at the default root at startup and has exited since.
+fn pin_config_home(command: &mut Command, root: Option<std::ffi::OsString>) {
+    match root {
+        Some(root) => command.env("XDG_CONFIG_HOME", root),
+        None => command.env_remove("XDG_CONFIG_HOME"),
+    };
 }
 
 /// Windows resolves a bare command name to `herdr.exe`; an explicit probe has to
@@ -89,12 +105,9 @@ pub(crate) fn executable() -> PathBuf {
                 }),
         )
         .chain(
-            [
-                PathBuf::from("/opt/homebrew/bin/herdr"),
-                PathBuf::from("/usr/local/bin/herdr"),
-            ]
-            .into_iter()
-            .filter(|_| cfg!(unix)),
+            crate::local_path::HOMEBREW_DIRS
+                .iter()
+                .map(|dir| Path::new(dir).join(NAME)),
         );
     candidates
         .into_iter()
@@ -236,9 +249,8 @@ fn detach(command: &mut Command) {
 fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    // The server is a console program; launched from the GUI it must not flash one.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    // Replaces the flags `new_command` set, so keep the one that opens no window.
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | herdr_client::CREATE_NO_WINDOW);
 }
 
 fn connect_or_start(
@@ -259,18 +271,12 @@ fn connect_or_start(
         Err(error) => return Err(error),
     }
     if stop.load(Ordering::Acquire) {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            crate::Error::DaemonCancelled,
-        ));
+        return Err(io::Error::new(io::ErrorKind::Interrupted, Error::Cancelled));
     }
     let mut command = command();
     // Login-shell initialization can outlast a detach or reconnect.
     if stop.load(Ordering::Acquire) {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            crate::Error::DaemonCancelled,
-        ));
+        return Err(io::Error::new(io::ErrorKind::Interrupted, Error::Cancelled));
     }
     command
         .stdin(Stdio::null())
@@ -281,7 +287,7 @@ fn connect_or_start(
         if error.kind() == io::ErrorKind::NotFound {
             io::Error::new(error.kind(), MissingInstallation(error))
         } else {
-            io::Error::new(error.kind(), crate::Error::DaemonSpawn { source: error })
+            io::Error::new(error.kind(), Error::Spawn { source: error })
         }
     })?;
     // The daemon outlives the window. Reap it if it exits while the GUI is alive.
@@ -294,10 +300,7 @@ fn connect_or_start(
     let deadline = Instant::now() + timeout;
     loop {
         if stop.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                crate::Error::DaemonCancelled,
-            ));
+            return Err(io::Error::new(io::ErrorKind::Interrupted, Error::Cancelled));
         }
         match Stream::connect(socket) {
             Ok(stream) => return Ok(stream),
@@ -311,11 +314,11 @@ fn connect_or_start(
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                crate::Error::DaemonTimeout(socket.to_owned()),
+                Error::Timeout(socket.to_owned()),
             ));
         }
         if let Ok(status) = exit_rx.try_recv() {
-            return Err(io::Error::other(crate::Error::DaemonExited(status?)));
+            return Err(io::Error::other(Error::Exited(status?)));
         }
         thread::sleep(Duration::from_millis(50));
     }

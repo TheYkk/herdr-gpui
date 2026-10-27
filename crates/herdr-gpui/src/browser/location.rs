@@ -16,6 +16,32 @@ const PREVIEW_ORIGINS: [&str; 3] = [
     "https://herdr-preview.localhost/",
 ];
 
+/// The frame a page's message came from, by its address. wry gives every
+/// frame of every page `window.ipc`, so only this tells a local page's own
+/// script from a web page it embeds or is navigating to.
+#[cfg(any(target_os = "macos", windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PostedFrom {
+    /// A frame showing a local file through the preview scheme.
+    Preview,
+    /// Any other frame: a web page, `about:` frames, or an unknown address.
+    Elsewhere,
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
+impl PostedFrom {
+    pub(crate) fn of(frame_url: &str) -> Self {
+        if PREVIEW_ORIGINS
+            .iter()
+            .any(|origin| frame_url.starts_with(origin))
+        {
+            Self::Preview
+        } else {
+            Self::Elsewhere
+        }
+    }
+}
+
 #[cfg(any(target_os = "macos", windows, test))]
 /// Everything but unreserved characters is escaped in a path segment.
 const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
@@ -50,9 +76,9 @@ pub(crate) enum Location {
     Devices,
 }
 
-/// The checkout an orchestrator tab lists the repository of, on the tab's
-/// endpoint, which may be an SSH host. Saved with the tabs, so it is checked
-/// again whenever it is read.
+/// The checkout an orchestrator view lists the repository of, on the view's
+/// endpoint, which may be an SSH host. Tabs saved by earlier builds carry
+/// one, so it is checked again whenever it is read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SavedOrchestratorRepo")]
 pub(crate) struct OrchestratorRepo {
@@ -97,18 +123,21 @@ impl OrchestratorRepo {
 }
 
 /// The local checkout a review tab shows. Saved with the tabs, so it is
-/// checked again whenever it is read.
+/// checked again whenever it is read. `repo_key` is the daemon's Git common
+/// directory; a space it has no worktree metadata for is saved by its
+/// directory alone, which the worker resolves and verifies on every read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SavedReviewCheckout")]
 pub(crate) struct ReviewCheckout {
-    pub(crate) repo_key: String,
+    pub(crate) repo_key: Option<String>,
     pub(crate) branch: String,
     pub(crate) checkout: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct SavedReviewCheckout {
-    repo_key: String,
+    #[serde(default)]
+    repo_key: Option<String>,
     branch: String,
     checkout: Option<String>,
 }
@@ -126,7 +155,11 @@ impl TryFrom<SavedReviewCheckout> for ReviewCheckout {
         let branch = !saved.branch.is_empty()
             && saved.branch.len() <= 1024
             && !saved.branch.chars().any(char::is_control);
-        if !path(&saved.repo_key) || !branch || saved.checkout.as_deref().is_some_and(|c| !path(c))
+        let named = saved.repo_key.is_some() || saved.checkout.is_some();
+        if !named
+            || saved.repo_key.as_deref().is_some_and(|key| !path(key))
+            || !branch
+            || saved.checkout.as_deref().is_some_and(|c| !path(c))
         {
             return Err(crate::Error::InvalidReviewCheckout);
         }
@@ -138,14 +171,18 @@ impl TryFrom<SavedReviewCheckout> for ReviewCheckout {
     }
 }
 
-/// A review is saved by repository, so only a checkout the daemon named one
-/// for can be reviewed.
+/// A review is saved by the repository the daemon names, or else by the
+/// workspace directory the Git chip follows; one naming neither has nothing
+/// to read.
 impl TryFrom<&crate::pull_request::Input> for ReviewCheckout {
     type Error = crate::Error;
 
     fn try_from(input: &crate::pull_request::Input) -> crate::Result<Self> {
+        if input.repo_key.is_none() && input.checkout.is_none() {
+            return Err(herdr_github::pull_request::Error::Metadata.into());
+        }
         Ok(Self {
-            repo_key: input.repo_key.clone().ok_or(crate::Error::PrMetadata)?,
+            repo_key: input.repo_key.clone(),
             branch: input.branch.clone(),
             checkout: input.checkout.clone(),
         })
@@ -156,7 +193,7 @@ impl From<&ReviewCheckout> for crate::pull_request::Input {
     fn from(checkout: &ReviewCheckout) -> Self {
         Self {
             checkout: checkout.checkout.clone(),
-            repo_key: Some(checkout.repo_key.clone()),
+            repo_key: checkout.repo_key.clone(),
             branch: checkout.branch.clone(),
         }
     }
@@ -374,6 +411,27 @@ pub(crate) fn requested_file(root: &Path, request_path: &str) -> Option<PathBuf>
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn only_preview_frames_count_as_local() {
+        for local in [
+            "herdr-preview://localhost/index.html",
+            "http://herdr-preview.localhost/docs/a.html",
+            "https://herdr-preview.localhost/",
+        ] {
+            assert_eq!(PostedFrom::of(local), PostedFrom::Preview, "{local}");
+        }
+        for other in [
+            "https://evil.test/",
+            "https://herdr-preview.localhost.evil.test/",
+            "http://evil.test/?u=herdr-preview://localhost/",
+            "about:srcdoc",
+            "about:blank",
+            "",
+        ] {
+            assert_eq!(PostedFrom::of(other), PostedFrom::Elsewhere, "{other}");
+        }
+    }
 
     #[cfg(unix)]
     fn file(path: &str) -> crate::Result<LocalFile> {

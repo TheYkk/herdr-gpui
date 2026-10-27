@@ -8,13 +8,13 @@ fn holds_then_releases_on_one_worker_thread(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| toggle_with(cx, holder(&log), reports.sink()));
     assert_eq!(cup_of(cx), Cup::Pending);
     cx.run_until_parked();
-    assert_eq!(cup_of(cx), Cup::On);
+    assert_eq!(cup_of(cx), Cup::On(Mode::Indefinite));
 
     // The worker already exists, so this start must never run.
     cx.update(|cx| {
         toggle_with(
             cx,
-            || -> keepawake::Result<Held> { unreachable!() },
+            |_| -> keepawake::Result<Held> { unreachable!() },
             reports.sink(),
         )
     });
@@ -34,7 +34,7 @@ fn holds_then_releases_on_one_worker_thread(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn a_failed_hold_stays_off_and_keeps_its_source(cx: &mut gpui::TestAppContext) {
     let reports = Reports::default();
-    let failing = || -> keepawake::Result<Held> {
+    let failing = |_| -> keepawake::Result<Held> {
         Err(keepawake::BuilderError::ValidationError("no power".into()).into())
     };
     cx.update(|cx| toggle_with(cx, failing, reports.sink()));
@@ -42,7 +42,7 @@ fn a_failed_hold_stays_off_and_keeps_its_source(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(cup_of(cx), Cup::Off);
     let errors = reports.take();
-    let [Error::Caffeine(source)] = errors.as_slice() else {
+    let [crate::Error::Caffeine(Error::Hold(source))] = errors.as_slice() else {
         panic!("expected one Caffeine error, got {errors:?}");
     };
     assert!(matches!(
@@ -55,7 +55,7 @@ fn a_failed_hold_stays_off_and_keeps_its_source(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         toggle_with(
             cx,
-            || -> keepawake::Result<Held> { unreachable!() },
+            |_| -> keepawake::Result<Held> { unreachable!() },
             reports.sink(),
         )
     });
@@ -73,7 +73,7 @@ fn clicks_while_pending_are_ignored(cx: &mut gpui::TestAppContext) {
     });
     cx.run_until_parked();
 
-    assert_eq!(cup_of(cx), Cup::On);
+    assert_eq!(cup_of(cx), Cup::On(Mode::Indefinite));
     assert_eq!(log.entries().len(), 1);
 
     cx.update(|cx| {
@@ -100,22 +100,22 @@ impl Drop for PanicsOnRelease {
 #[gpui::test]
 fn a_worker_that_dies_releasing_reads_off_and_is_replaced(cx: &mut gpui::TestAppContext) {
     let (log, reports) = (Log::default(), Reports::default());
-    cx.update(|cx| toggle_with(cx, || Ok(PanicsOnRelease), reports.sink()));
+    cx.update(|cx| toggle_with(cx, |_| Ok(PanicsOnRelease), reports.sink()));
     cx.run_until_parked();
-    assert_eq!(cup_of(cx), Cup::On);
+    assert_eq!(cup_of(cx), Cup::On(Mode::Indefinite));
 
     cx.update(|cx| toggle_with(cx, holder(&log), reports.sink()));
     cx.run_until_parked();
     assert_eq!(cup_of(cx), Cup::Off);
     assert!(matches!(
         reports.take().as_slice(),
-        [Error::CaffeineWorkerStopped]
+        [crate::Error::Caffeine(Error::WorkerStopped)]
     ));
 
     // A fresh worker takes the next click.
     cx.update(|cx| toggle_with(cx, holder(&log), reports.sink()));
     cx.run_until_parked();
-    assert_eq!(cup_of(cx), Cup::On);
+    assert_eq!(cup_of(cx), Cup::On(Mode::Indefinite));
     assert_eq!(log.entries().len(), 1);
     cx.update(|cx| toggle_with(cx, holder(&log), reports.sink()));
     cx.run_until_parked();

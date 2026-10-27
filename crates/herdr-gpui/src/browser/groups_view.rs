@@ -10,9 +10,40 @@ use super::{
     groups::{GroupId, Layout, Pick, Shown, Slot},
     view::store,
 };
-use crate::{HerdrWindow, NavigationTarget, search_input::SearchInput};
+use crate::{HerdrWindow, NavigationTarget, controls::Command, search_input::SearchInput};
 use gpui::{prelude::*, *};
 use std::{collections::hash_map::Entry, time::Instant};
+
+/// The tab a strip listing `tabs` goes to when `pick` leaves it: the nearest
+/// one after it that `near` accepts, or else before it.
+fn neighbour(tabs: &[Pick], pick: &Pick, near: impl Fn(&Pick) -> bool) -> Option<Pick> {
+    let position = tabs.iter().position(|tab| tab == pick)?;
+    tabs[position + 1..]
+        .iter()
+        .find(|tab| near(tab))
+        .or_else(|| tabs[..position].iter().rev().find(|tab| near(tab)))
+        .cloned()
+}
+
+/// The tab Next Tab, Previous Tab, or a tab by number lands on among `tabs`
+/// from `current`. Next and Previous wrap around, and a number counts from
+/// one, as Herdr's `switch_tab` does.
+fn stepped<'a>(tabs: &'a [Pick], current: Option<&Pick>, command: Command) -> Option<&'a Pick> {
+    let index = match command {
+        Command::TabNumber(number) => usize::from(number).checked_sub(1)?,
+        Command::NextTab | Command::PreviousTab => {
+            let index = tabs.iter().position(|tab| Some(tab) == current)?;
+            let step = if command == Command::NextTab {
+                1
+            } else {
+                tabs.len() - 1
+            };
+            (index + step) % tabs.len()
+        }
+        _ => return None,
+    };
+    tabs.get(index)
+}
 
 impl HerdrWindow {
     /// The daemon's focused tab, when it belongs to the focused workspace.
@@ -96,24 +127,26 @@ impl HerdrWindow {
             group,
             layout.share(group),
             |other| layout.share(other),
-            Instant::now(),
+            crate::motion::now(),
         )
     }
 
     /// How far `group` has opened from its split, or `None` once open.
     pub(crate) fn group_opened(&self, group: GroupId) -> Option<f32> {
-        self.browser.group_motion.opened(group, Instant::now())
+        self.browser
+            .group_motion
+            .opened(group, crate::motion::now())
     }
 
     /// The closed groups still folding away.
     pub(crate) fn folding_groups(&self) -> Vec<super::Fold> {
-        self.browser.group_motion.folding(Instant::now())
+        self.browser.group_motion.folding(crate::motion::now())
     }
 
     /// Whether a group is still opening or folding, so the window draws
     /// another frame.
     pub(crate) fn groups_moving(&mut self) -> bool {
-        self.browser.group_motion.animating(Instant::now())
+        self.browser.group_motion.animating(crate::motion::now())
     }
 
     /// The tab `group` picked, the focused one when it follows the terminal.
@@ -142,6 +175,12 @@ impl HerdrWindow {
                 .any(|layout| layout.slots().any(|slot| slot.id == group))
         };
         self.browser.appear.retain(live);
+        self.browser.tab_body.retain(live);
+        self.browser
+            .group_bounds
+            .borrow_mut()
+            .retain(|group, _| live(*group));
+        self.browser.emptied.retain(|group| live(*group));
         // The group drawn before any workspace has a layout keeps its strip.
         let fallback = self.browser.fallback_group;
         self.browser
@@ -167,7 +206,7 @@ impl HerdrWindow {
         let growing = self
             .browser
             .appear
-            .growth(group, pick, Instant::now())
+            .growth(group, pick, crate::motion::now())
             .is_some();
         self.browser
             .tab_scroll
@@ -207,6 +246,13 @@ impl HerdrWindow {
         self.browser.appear.animating()
     }
 
+    /// Makes groups open and fold, held where their motion starts.
+    #[cfg(test)]
+    pub(crate) fn hold_group_motion(&mut self) {
+        self.browser.group_motion.enable();
+        self.browser.group_motion.freeze(std::time::Duration::ZERO);
+    }
+
     /// Ends every tab's growing and shrinking at once, as a moment later.
     #[cfg(test)]
     pub(crate) fn settle_tabs(&mut self) {
@@ -219,9 +265,13 @@ impl HerdrWindow {
         /// Wider than any label a strip shows, so the last frame of growth
         /// does not visibly clamp a long one.
         const GROWN: f32 = 480.;
-        match self.browser.appear.growth(group, pick, Instant::now()) {
+        match self
+            .browser
+            .appear
+            .growth(group, pick, crate::motion::now())
+        {
             Some(k) => tab
-                .min_w(px(crate::TAB_WIDTH * k))
+                .min_w(px(self.tab_layout().min_width() * k))
                 .max_w(px(GROWN * k))
                 .overflow_hidden()
                 .opacity(k),
@@ -229,17 +279,55 @@ impl HerdrWindow {
         }
     }
 
-    /// Whether `group`'s strip lists `pick`; see [`Layout::lists`].
+    /// Whether `group`'s strip lists `pick`; see [`Layout::lists`]. A tab
+    /// this window hides is listed only while the group shows it.
     pub(crate) fn group_lists(&self, group: GroupId, pick: &Pick) -> bool {
+        if self.hides_tab(pick) && self.shown_pick(group).as_ref() != Some(pick) {
+            return false;
+        }
         let Some(layout) = self.layout() else {
             return true;
         };
-        layout.lists(group, pick, self.primary_group().unwrap_or(group))
+        layout.lists(group, pick)
     }
 
-    /// The tabs `group`'s strip lists, in strip order: Herdr tabs first,
-    /// then browser tabs.
-    pub(crate) fn group_tabs(&self, group: GroupId, cx: &App) -> Vec<Pick> {
+    /// What `group` shows, reading a window without groups yet as one
+    /// following the terminal.
+    fn shown_pick(&self, group: GroupId) -> Option<Pick> {
+        let focused = self.focused_herdr_tab();
+        match self.layout() {
+            Some(layout) => layout.pick(group, focused),
+            None => focused.map(|tab| Pick::Herdr(tab.to_owned())),
+        }
+    }
+
+    /// Whether this window keeps `pick` out of the focused workspace's
+    /// strips; see [`super::hidden`].
+    fn hides_tab(&self, pick: &Pick) -> bool {
+        !self.browser.hidden.is_empty()
+            && self
+                .browser_key()
+                .is_some_and(|key| self.browser.hidden.hides(&key, pick))
+    }
+
+    /// The focused workspace's tabs this window lists, in strip order:
+    /// Herdr tabs first, then browser tabs. A hidden tab counts while a
+    /// group shows it.
+    fn workspace_tabs(&self, cx: &App) -> Vec<Pick> {
+        let slots = self.group_slots();
+        self.open_workspace_tabs(cx)
+            .into_iter()
+            .filter(|pick| {
+                !self.hides_tab(pick)
+                    || slots
+                        .iter()
+                        .any(|slot| self.shown_pick(slot.id).as_ref() == Some(pick))
+            })
+            .collect()
+    }
+
+    /// Every tab of the focused workspace, hidden ones included.
+    pub(crate) fn open_workspace_tabs(&self, cx: &App) -> Vec<Pick> {
         let herdr = self.live.snapshot.as_ref().map(|snapshot| {
             snapshot
                 .tabs
@@ -252,51 +340,160 @@ impl HerdrWindow {
             .unwrap_or_default()
             .into_iter()
             .chain(self.browser_tab_ids(cx).into_iter().map(Pick::Page))
+            .collect()
+    }
+
+    /// The tabs `group`'s strip lists, in strip order.
+    pub(crate) fn group_tabs(&self, group: GroupId, cx: &App) -> Vec<Pick> {
+        self.workspace_tabs(cx)
+            .into_iter()
             .filter(|pick| self.group_lists(group, pick))
             .collect()
     }
 
-    /// Closes `picks` in `group` alone, as an editor closes tabs in one of
-    /// its groups: they stay open in Herdr, in the browser, and in every
-    /// other group. A group closing the tab it shows moves to the tab after
-    /// it in its strip, or before it; a group left with none closes.
-    pub(crate) fn close_in_group(
+    /// Moves `pick` to `group` and shows it there, as dropping its tab on
+    /// the group does, or asking there for a tab a workspace has one of. The
+    /// group it leaves goes to the tab after it in its strip, or before it,
+    /// and closes when it was its last.
+    pub(crate) fn move_tab_to_group(
         &mut self,
+        pick: Pick,
         group: GroupId,
-        picks: Vec<Pick>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let before = self.group_tabs(group, cx);
-        let current = self.group_pick(group);
-        let Some(layout) = self.ensure_layout() else {
+        let Some(source) = self.ensure_layout().map(|layout| layout.owner(&pick)) else {
             return;
         };
-        layout.hide(group, picks.iter().cloned());
-        let after = self.group_tabs(group, cx);
-        if after.is_empty() {
-            self.close_group(group, window, cx);
+        if !self.group_slots().iter().any(|slot| slot.id == group) {
             return;
         }
-        if current
-            .as_ref()
-            .is_some_and(|current| picks.contains(current))
-        {
-            let position = current
-                .and_then(|current| before.iter().position(|pick| *pick == current))
-                .unwrap_or(0);
-            let next = before[position..]
-                .iter()
-                .chain(before[..position].iter().rev())
-                .find(|pick| after.contains(pick))
-                .cloned();
-            match next {
-                Some(Pick::Herdr(tab)) => self.choose_herdr_tab(group, &tab, window, cx),
-                Some(Pick::Page(id)) => self.show_browser_tab_in(Some(group), id, window, cx),
-                None => {}
-            }
+        if source == group {
+            self.show_group_tab(group, pick, window, cx);
+            return;
+        }
+        let before = self.group_tabs(source, cx);
+        let shown = self.group_pick(source).as_ref() == Some(&pick);
+        self.show_group_tab(group, pick.clone(), window, cx);
+        if !shown {
+            return;
+        }
+        if !self.show_neighbour(source, &before, &pick, cx) {
+            self.close_group(source, window, cx);
         }
         cx.notify();
+    }
+
+    /// Moves the group showing `pick` on to the tab after it in its strip,
+    /// or before it, as when the tab is carried off to another window. A
+    /// group with no other tab keeps showing it.
+    pub(crate) fn leave_tab(&mut self, pick: &Pick, cx: &mut Context<Self>) {
+        let Some(source) = self.ensure_layout().map(|layout| layout.owner(pick)) else {
+            return;
+        };
+        if self.group_pick(source).as_ref() != Some(pick) {
+            return;
+        }
+        let before = self.group_tabs(source, cx);
+        if self.show_neighbour(source, &before, pick, cx) {
+            cx.notify();
+        }
+    }
+
+    /// Shows in `source` the neighbour of `pick` among `before`, its strip
+    /// as it was; whether it had one.
+    fn show_neighbour(
+        &mut self,
+        source: GroupId,
+        before: &[Pick],
+        pick: &Pick,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(next) = neighbour(before, pick, |_| true) else {
+            return false;
+        };
+        if let Some(layout) = self.ensure_layout() {
+            layout.show(source, next);
+        }
+        self.reconcile_group_terminals(cx);
+        self.steer_primary_group(source, cx);
+        true
+    }
+
+    /// Runs Next Tab, Previous Tab, or a tab by number over the focused
+    /// workspace's tabs, its browser tabs included, from the tab the group in
+    /// use shows. The daemon knows only its own tabs, so asking it alone
+    /// would skip the pages, and would leave a page in front of the Herdr tab
+    /// it already focuses. From a terminal to a terminal, the daemon still
+    /// moves its focus and the groups follow; a step from or to a page shows
+    /// its tab in its own group, as clicking it does. Returns false without a
+    /// focused workspace.
+    pub(crate) fn step_tab(
+        &mut self,
+        command: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(active) = self.ensure_layout().map(|layout| layout.active()) else {
+            return false;
+        };
+        // A focus change in flight lands after this step and would move the
+        // group off a page the step showed, so the step is dropped, as one
+        // asked of the daemon always was.
+        if self.activation_deadline.is_some() {
+            return true;
+        }
+        let tabs = self.workspace_tabs(cx);
+        let current = self.group_pick(active).or_else(|| {
+            self.focused_herdr_tab()
+                .map(|tab| Pick::Herdr(tab.to_owned()))
+        });
+        let Some(target) = stepped(&tabs, current.as_ref(), command).cloned() else {
+            return true;
+        };
+        match target {
+            Pick::Herdr(tab) if !matches!(current, Some(Pick::Page(_))) => {
+                self.navigate(NavigationTarget::Tab(&tab), cx);
+                window.focus(&self.focus, cx);
+            }
+            target => {
+                if let Some(group) = self.layout().map(|layout| layout.owner(&target)) {
+                    self.show_group_tab(group, target, window, cx);
+                }
+            }
+        }
+        true
+    }
+
+    /// Shows `pick` in `group`, which owns it.
+    fn show_group_tab(
+        &mut self,
+        group: GroupId,
+        pick: Pick,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match pick {
+            Pick::Herdr(tab) => self.choose_herdr_tab(group, &tab, window, cx),
+            Pick::Page(id) => self.show_browser_tab_in(Some(group), id, window, cx),
+        }
+    }
+
+    /// Steers a group's existing primary connection after replacing its tab,
+    /// without activating the group or taking keyboard focus from a page.
+    fn steer_primary_group(&mut self, group: GroupId, cx: &mut Context<Self>) {
+        if Some(group) != self.primary_group() {
+            return;
+        }
+        if let Some(Pick::Herdr(tab)) = self.group_pick(group)
+            && self.focused_herdr_tab() != Some(tab.as_str())
+        {
+            if self.input_ready() && self.menu.page.is_none() {
+                self.navigate(NavigationTarget::Tab(&tab), cx);
+            } else {
+                self.pending_navigation = Some(NavigationTarget::Tab(tab));
+            }
+        }
     }
 
     /// What `group` draws. A page another window closed reads as nothing
@@ -308,19 +505,14 @@ impl HerdrWindow {
         let focused = |group| self.group_focused_tab(group);
         let shown = layout.shown(group, focused);
         match &shown {
-            Shown::Page(id) | Shown::Elsewhere(Pick::Page(id))
-                if store(cx).is_none_or(|store| store.get(*id).is_none()) =>
-            {
+            Shown::Page(id) if store(cx).is_none_or(|store| store.get(*id).is_none()) => {
                 Shown::Empty
             }
             // The window's connection is on its way to the tab its group
-            // picked and no other group shows it: the terminal keeps its
-            // frame until the daemon focuses the tab, rather than flashing
-            // a stand-in for one round trip.
-            Shown::Elsewhere(pick @ Pick::Herdr(tab))
-                if Some(group) == self.primary_group()
-                    && layout.holder(pick, &focused) == Some(group)
-                    && !self.parked_focuses(tab) =>
+            // picked: the terminal keeps its frame until the daemon focuses
+            // the tab, rather than flashing a stand-in for one round trip.
+            Shown::Elsewhere(tab)
+                if Some(group) == self.primary_group() && !self.parked_focuses(tab) =>
             {
                 Shown::Terminal
             }
@@ -344,7 +536,7 @@ impl HerdrWindow {
     /// The pages live in some group, which the window presents.
     #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn live_pages(&self, cx: &App) -> Vec<TabId> {
-        self.group_slots()
+        self.drawn_group_slots()
             .into_iter()
             .filter_map(|slot| match self.group_shown(slot.id, cx) {
                 Shown::Page(id) => Some(id),
@@ -362,12 +554,10 @@ impl HerdrWindow {
         if self.primary_group() != Some(group) {
             return;
         }
-        let focused = self.focused_herdr_tab().map(str::to_owned);
-        if let Some(Pick::Herdr(tab)) = self.group_pick(group)
-            && focused.as_deref() != Some(tab.as_str())
-        {
-            self.navigate(NavigationTarget::Tab(&tab), cx);
-        }
+        // This choice supersedes any deferred target, including when its
+        // terminal is already focused and needs no new request.
+        self.pending_navigation = None;
+        self.steer_primary_group(group, cx);
         if matches!(self.group_pick(group), Some(Pick::Herdr(_)) | None) {
             window.focus(&self.focus, cx);
         }
@@ -418,11 +608,12 @@ impl HerdrWindow {
     }
 
     /// Follows the window's connection moving its focus, from a shortcut, an
-    /// agent, a closed tab, or a group's "+". The group holding the
-    /// connection shows the new tab, unless a "+" asked for it in another
-    /// group, which then takes the connection; the group that had it gets a
-    /// parked one for its own tab. Arriving in another workspace moves its
-    /// group only off a Herdr tab: one showing a page keeps it.
+    /// agent, a closed tab, or a group's "+". The tab's own group shows it
+    /// and takes the connection; a new tab goes to the group whose "+" asked
+    /// for it, or else to the group in use. The group that had the
+    /// connection gets a parked one for its own tab. Arriving in another
+    /// workspace moves its group only off a Herdr tab: one showing a page
+    /// keeps it.
     pub(crate) fn terminal_focus_moved(
         &mut self,
         new: &str,
@@ -448,55 +639,110 @@ impl HerdrWindow {
         if arrived && (on_page || restoring) {
             return;
         }
+        // The daemon moved on from a tab it closed. When that lands in
+        // another group, the group that showed the closed tab goes to one of
+        // its own instead; see `settle_groups`.
+        let left_closed = primary
+            .and_then(|group| self.group_pick(group))
+            .is_some_and(|pick| !self.workspace_tabs(cx).contains(&pick));
+        let pick = Pick::Herdr(new.to_owned());
         let layout = self.layout_for(key);
-        match (asked, primary) {
-            (Some(group), _) => {
-                layout.choose(group, Pick::Herdr(new.to_owned()));
+        let split = layout.len() > 1;
+        let target = asked.or_else(|| {
+            if !split {
+                return None;
+            }
+            Some(layout.claimed(&pick).unwrap_or(layout.active()))
+        });
+        // The group holding the connection keeps it for a tab of its own,
+        // without becoming the group in use: an agent must not take that
+        // from a group showing a tab. A group in use that shows none has
+        // nothing to keep, and Close Tab there would close the group rather
+        // than the tab the focus just moved to.
+        let idle = layout.pick(layout.active(), None).is_none();
+        let own = target.is_some()
+            && target == primary
+            && !idle
+            && primary.is_some_and(|primary| layout.pick(primary, None).is_some());
+        match (target, primary) {
+            (Some(group), Some(primary)) if group != primary && left_closed && asked.is_none() => {}
+            (Some(group), _) if !own => {
+                layout.choose(group, pick);
                 self.set_primary_group(group);
             }
-            (None, Some(primary)) => layout.focus_moved(primary, new),
-            (None, None) => {}
+            (_, Some(primary)) => layout.focus_moved(primary, new),
+            (_, None) => {}
         }
         self.reconcile_group_terminals(cx);
         cx.notify();
     }
 
-    /// Lets groups that picked a Herdr tab the daemon closed follow the
-    /// terminal instead.
-    pub(crate) fn forget_closed_herdr_tabs(&mut self, cx: &mut Context<Self>) {
+    /// Keeps the focused workspace's groups in step with its tabs, on every
+    /// tick: forgets the tabs that closed, names the group in use as the
+    /// owner of each tab that has none, gives a group whose tab closed
+    /// another of its own, and closes a group whose last tab closed.
+    pub(crate) fn settle_groups(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(key), Some(snapshot)) = (self.browser_key(), self.live.snapshot.clone()) else {
             return;
         };
-        let focused = self.focused_herdr_tab().map(str::to_owned);
+        if snapshot.focused_workspace_id.as_ref() != Some(&key.1) {
+            return;
+        }
+        let open = self.open_workspace_tabs(cx);
+        self.browser.hidden.retain_open(&key, &open);
+        let tabs = self.workspace_tabs(cx);
         let Some(layout) = self.browser.layouts.get_mut(&key) else {
             return;
         };
         let closed: Vec<Pick> = layout
-            .picks()
-            .filter(|pick| {
-                matches!(pick, Pick::Herdr(tab) if !snapshot.tabs.iter().any(|candidate| {
-                    &candidate.tab_id == tab && candidate.workspace_id == key.1
-                }))
-            })
+            .tabs()
+            .filter(|pick| !tabs.contains(pick))
             .cloned()
             .collect();
+        // With the groups whose tab was found closed before this ran.
+        let mut emptied: Vec<GroupId> = layout
+            .slots()
+            .map(|slot| slot.id)
+            .filter(|group| self.browser.emptied.contains(group))
+            .collect();
+        self.browser
+            .emptied
+            .retain(|group| !emptied.contains(group));
         for pick in &closed {
-            layout.replace(pick, None, focused.as_deref());
+            emptied.extend(layout.forget(pick));
         }
-        // Closed-in-group marks for tabs the daemon closed go with them.
-        layout.forget_hidden(|pick| match pick {
-            Pick::Herdr(tab) => snapshot
-                .tabs
-                .iter()
-                .any(|candidate| &candidate.tab_id == tab && candidate.workspace_id == key.1),
-            Pick::Page(id) => store(cx).is_some_and(|store| store.get(*id).is_some()),
-        });
-        if !closed.is_empty() {
+        layout.adopt(tabs);
+        let mut changed = !closed.is_empty();
+        if layout.len() > 1 {
+            for slot in self.group_slots() {
+                if self.group_pick(slot.id).is_some() {
+                    continue;
+                }
+                match self.group_tabs(slot.id, cx).into_iter().next() {
+                    Some(next) => {
+                        if let Some(layout) = self.browser.layouts.get_mut(&key) {
+                            layout.show(slot.id, next);
+                        }
+                        // The window's connection goes to its group's tab;
+                        // a parked one is steered there as it is reconciled.
+                        self.steer_primary_group(slot.id, cx);
+                        changed = true;
+                    }
+                    None if emptied.contains(&slot.id) => {
+                        self.close_group(slot.id, window, cx);
+                        changed = true;
+                    }
+                    None => {}
+                }
+            }
+        }
+        if changed {
             cx.notify();
         }
     }
 
-    /// Shows a browser tab in the group in use.
+    /// Shows a browser tab in its group, or in the group in use when it is
+    /// new.
     pub(crate) fn show_browser_tab(
         &mut self,
         id: TabId,
@@ -506,8 +752,8 @@ impl HerdrWindow {
         self.show_browser_tab_in(None, id, window, cx);
     }
 
-    /// Shows a browser tab in `group`, or in the group in use of the tab's
-    /// workspace.
+    /// Shows a browser tab in `group`, which takes it, or else in the group
+    /// it belongs to: the group in use of its workspace when it is new.
     pub(crate) fn show_browser_tab_in(
         &mut self,
         group: Option<GroupId>,
@@ -519,12 +765,15 @@ impl HerdrWindow {
             return;
         };
         let layout = self.layout_for((tab.scope.clone(), tab.workspace_id.clone()));
-        let group = group.unwrap_or(layout.active());
+        let group = group.unwrap_or_else(|| layout.owner(&Pick::Page(id)));
         layout.choose(group, Pick::Page(id));
-        if tab.place.is_code() {
-            // The VS Code tab's page waits for its server, and carries its
-            // token.
-            self.ensure_code_page(window, cx);
+        // A page chosen in the primary group replaces its pending terminal
+        // choice. Pages in other groups leave that navigation alone.
+        if self.primary_group() == Some(group) {
+            self.pending_navigation = None;
+        }
+        if let Some(editor) = tab.place.editor() {
+            self.ensure_editor_page(editor, window, cx);
         } else {
             #[cfg(any(target_os = "macos", windows))]
             match self.browser.pages.ensure(&tab, window, cx) {
@@ -538,7 +787,7 @@ impl HerdrWindow {
             }
         }
         self.sync_address(group, Some(&tab), true, window, cx);
-        if tab.location.is_none() {
+        if tab.location.is_none() && !tab.place.is_editor() {
             let focus = self.group_address(group, cx).read(cx).focus.clone();
             window.focus(&focus, cx);
         }
@@ -558,43 +807,57 @@ impl HerdrWindow {
         self.open_browser_tab(None, window, cx);
     }
 
-    /// Closes a browser tab. Groups that picked it move to the browser tab
-    /// after it, or before it, or else follow the terminal.
+    /// Closes a browser tab. The group showing it moves to the tab after it
+    /// in its strip, or before it; a group of a split left with none closes.
     pub(crate) fn close_browser_tab(
         &mut self,
         id: TabId,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(tab) = store(cx).and_then(|store| store.get(id)).cloned() else {
             return;
         };
-        let order: Vec<TabId> = store(cx)
-            .map(|store| {
-                store
-                    .in_workspace(&tab.scope, &tab.workspace_id)
-                    .map(|tab| tab.id)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let position = order.iter().position(|tab| *tab == id).unwrap_or(0);
-        let next = order
-            .get(position + 1)
-            .or_else(|| position.checked_sub(1).and_then(|before| order.get(before)))
-            .copied();
+        let pick = Pick::Page(id);
         let key = (tab.scope.clone(), tab.workspace_id.clone());
-        let focused = (self.browser_key().as_ref() == Some(&key))
-            .then(|| self.focused_herdr_tab().map(str::to_owned))
-            .flatten();
-        if let Some(layout) = self.browser.layouts.get_mut(&key) {
-            layout.replace(&Pick::Page(id), next.map(Pick::Page), focused.as_deref());
-        }
+        // Only the focused workspace's strips are known here; another
+        // workspace's group is given a tab when it is next shown.
+        let focused = self.browser_key().as_ref() == Some(&key);
+        let group = self
+            .browser
+            .layouts
+            .get(&key)
+            .filter(|_| focused)
+            .map(|layout| layout.owner(&pick));
+        let before = group.map_or_else(Vec::new, |group| self.group_tabs(group, cx));
+        let shown = self
+            .browser
+            .layouts
+            .get_mut(&key)
+            .and_then(|layout| layout.forget(&pick));
         crate::browser::Store::update(cx, |store| store.close(id));
         self.forget_browser_tabs(|tab| tab == id);
+        if !focused {
+            self.browser.emptied.extend(shown);
+        }
+        if let (Some(group), Some(shown)) = (group, shown)
+            && group == shown
+        {
+            // Alone, a group moves among its browser tabs and otherwise
+            // follows the terminal again, wherever the daemon's focus is.
+            let split = self.is_split();
+            let near = |tab: &Pick| split || matches!(tab, Pick::Page(_));
+            match neighbour(&before, &pick, near) {
+                Some(next) => self.show_group_tab(group, next, window, cx),
+                None if split => self.close_group(group, window, cx),
+                None => {}
+            }
+        }
         cx.notify();
     }
 
-    /// Splits `group`: a new group to its right shows the same tab.
+    /// Splits `group`: a new group opens to its right without tabs, and
+    /// every tab stays where it is.
     pub(crate) fn split_group(
         &mut self,
         group: GroupId,
@@ -603,16 +866,22 @@ impl HerdrWindow {
     ) {
         let new = self.browser.group_ids.next();
         let focused = self.focused_herdr_tab().map(str::to_owned);
+        let tabs = self.workspace_tabs(cx);
+        // The group holding the window's connection keeps it: the new group
+        // has no tab to show yet.
+        let primary = self.primary_group();
         let Some(layout) = self.ensure_layout() else {
             return;
         };
-        if !layout.split(group, new, focused.as_deref()) {
+        if !layout.split(group, new, focused.as_deref(), tabs) {
             return;
         }
-        self.browser.group_motion.open(new, group, Instant::now());
-        // The new group shows the tab the window's connection shows, so it
-        // takes that connection, and the group it split from connects anew
-        // only once it picks a tab of its own.
+        if let Some(primary) = primary {
+            self.set_primary_group(primary);
+        }
+        self.browser
+            .group_motion
+            .open(new, group, crate::motion::now());
         self.bring_group_tab(new, window, cx);
         self.sync_addresses(true, window, cx);
         cx.notify();
@@ -625,7 +894,7 @@ impl HerdrWindow {
         }
     }
 
-    /// Closes `group`; its tabs stay in every other group's strip.
+    /// Closes `group`; its tabs go to the group that takes its room.
     pub(crate) fn close_group(
         &mut self,
         group: GroupId,
@@ -643,7 +912,7 @@ impl HerdrWindow {
         if let Some((index, share, into)) = target {
             self.browser
                 .group_motion
-                .fold(group, index, share, into, Instant::now());
+                .fold(group, index, share, into, crate::motion::now());
         }
         self.browser.addresses.remove(&group);
         self.forget_group_terminal(group);

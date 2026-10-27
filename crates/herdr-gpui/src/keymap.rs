@@ -4,16 +4,19 @@
 //! on top. The palette, keybindings page, menu bar, GPUI keymap, and prefix
 //! mode all read this one resolved answer. The daemon's `[[keys.command]]`
 //! shortcuts arrive with each snapshot instead, so they are matched against
-//! this answer when typed rather than resolved into it.
+//! this answer when typed rather than resolved into it; one bound to a
+//! catalog default's keystroke takes it over, as a daemon `[keys]` entry does.
 
 mod custom;
-mod daemon;
+pub(crate) mod daemon;
+mod error;
 
 pub(crate) use custom::Reach;
 pub(crate) use daemon::DaemonKeys;
+pub(crate) use error::Error;
 
 use crate::{
-    Error, Result,
+    Result,
     controls::{COMMANDS, Command},
 };
 use daemon::Trigger;
@@ -27,9 +30,25 @@ const MAX_KEYSTROKES: usize = 8;
 /// Far more chords than a keyboard has spare.
 const MAX_PANE_KEYS: usize = 64;
 
-/// The config's `[pane_keys]` table: a keystroke, and the keystroke the
-/// focused pane receives for it instead. An empty value removes a default.
+/// A pane key types a few characters; it is not a way to paste a file.
+const MAX_PANE_TEXT: usize = 1024;
+
+/// Marks a `[pane_keys]` value as text, as in Ghostty's `text:` binds.
+const TEXT_PREFIX: &str = "text:";
+
+/// The config's `[pane_keys]` table: a keystroke, and the keystroke or
+/// `text:` the focused pane receives for it instead. An empty value removes
+/// a default.
 pub(crate) type PaneKeys = BTreeMap<String, String>;
+
+/// What the focused pane receives for a `[pane_keys]` keystroke.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PaneKey {
+    /// Another keystroke, sent as a key event.
+    Key(Keystroke),
+    /// Text, sent byte for byte as committed text.
+    Text(String),
+}
 
 /// Ghostty's macOS line-editing chords, which every other Mac terminal also
 /// sends: Cmd-Left and Cmd-Right to the line's start and end, Cmd-Backspace
@@ -43,6 +62,13 @@ const DEFAULT_PANE_KEYS: &[(&str, &str)] = &[
     ("alt-left", "alt-b"),
     ("alt-right", "alt-f"),
 ];
+
+/// Shift-Enter as Alt-Enter, Esc CR, on every platform, as Herdr's web UI
+/// sends it. Herdr encodes Shift-Enter as a bare CR for a program that has
+/// enabled neither the kitty keyboard protocol nor modifyOtherKeys, so it
+/// would submit the line; Esc CR is the newline chord prompt_toolkit and zsh
+/// read instead.
+const PORTABLE_PANE_KEYS: &[(&str, &str)] = &[("shift-enter", "alt-enter")];
 
 /// Keystrokes the GUI config binds, with the command holding each. Spelling
 /// differences still name the same keystroke.
@@ -83,6 +109,9 @@ struct Shortcut {
     /// The key that completes a prefix chord. `None` binds `label` directly
     /// through GPUI's keymap.
     chord: Option<Keystroke>,
+    /// A catalog default that neither config file assigned. A daemon custom
+    /// command bound to the same keystroke takes it over.
+    catalog_default: bool,
 }
 
 impl Shortcut {
@@ -90,6 +119,7 @@ impl Shortcut {
         Self {
             label: label.into(),
             chord: None,
+            catalog_default: false,
         }
     }
 }
@@ -98,15 +128,15 @@ impl Shortcut {
 pub struct Keymap {
     /// Parallel to `COMMANDS`, primary shortcut first.
     shortcuts: Vec<Vec<Shortcut>>,
-    /// The keystrokes that start a chord, less any nothing can use. The
+    /// The keystrokes that start a chord, less any a GUI binding holds. The
     /// first one is the prefix shown to the user.
     prefixes: Vec<Keystroke>,
     /// Keys that move the workspace picker's selection up and down.
     navigate_up: Vec<Keystroke>,
     navigate_down: Vec<Keystroke>,
-    /// Keystrokes the focused pane receives as another keystroke. No command
-    /// is bound to them, so GPUI's keymap never claims them first.
-    pane_keys: Vec<(Keystroke, Keystroke)>,
+    /// Keystrokes the focused pane receives as another keystroke or as text.
+    /// No command is bound to them, so GPUI's keymap never claims them first.
+    pane_keys: Vec<(Keystroke, PaneKey)>,
 }
 
 impl Default for Keymap {
@@ -149,7 +179,7 @@ impl Keymap {
             let command = COMMANDS[index].name;
             let keystrokes: Vec<String> = binding.keystrokes().map(str::to_owned).collect();
             if keystrokes.len() > MAX_KEYSTROKES {
-                return Err(Error::TooManyKeystrokes(command));
+                return Err(Error::TooManyKeystrokes(command).into());
             }
             configured[index] = Some(keystrokes);
         }
@@ -164,7 +194,8 @@ impl Keymap {
                         keystroke: keystroke.clone(),
                         first,
                         second: info.name,
-                    });
+                    }
+                    .into());
                 }
             }
         }
@@ -174,7 +205,8 @@ impl Keymap {
                 return Err(Error::PaneKeyBound {
                     keystroke: typed.unparse(),
                     command,
-                });
+                }
+                .into());
             }
         }
         Ok(Self::layer(configured, &claimed, keys, pane_keys))
@@ -188,14 +220,14 @@ impl Keymap {
         configured: Vec<Option<Vec<String>>>,
         claimed: &Claimed,
         keys: &DaemonKeys,
-        pane_keys: Vec<(Keystroke, Keystroke)>,
+        pane_keys: Vec<(Keystroke, PaneKey)>,
     ) -> Self {
         // Keystrokes bound directly so far, which later layers cannot take.
         let mut taken: HashSet<_> = claimed.keys().cloned().collect();
         let prefixes: Vec<Keystroke> = keys
             .prefixes
             .iter()
-            .filter(|prefix| usable_prefix(prefix) && taken.insert(identity(prefix)))
+            .filter(|prefix| taken.insert(identity(prefix)))
             .cloned()
             .collect();
         let mut chords = HashSet::new();
@@ -230,6 +262,7 @@ impl Keymap {
                     Shortcut {
                         label: format!("{} {}", prefix.unparse(), keystroke.unparse()),
                         chord: Some(keystroke.clone()),
+                        catalog_default: false,
                     }
                 }
             };
@@ -248,7 +281,10 @@ impl Keymap {
                         Keystroke::parse(shortcut)
                             .is_ok_and(|parsed| !taken.contains(&identity(&parsed)))
                     })
-                    .map(|&shortcut| Shortcut::direct(shortcut))
+                    .map(|&shortcut| Shortcut {
+                        catalog_default: true,
+                        ..Shortcut::direct(shortcut)
+                    })
                     .chain(from_daemon)
                     .collect(),
             })
@@ -262,8 +298,8 @@ impl Keymap {
         }
     }
 
-    /// The keystroke the focused pane receives when `typed` is pressed.
-    pub(crate) fn pane_key(&self, typed: &Keystroke) -> Option<&Keystroke> {
+    /// What the focused pane receives when `typed` is pressed.
+    pub(crate) fn pane_key(&self, typed: &Keystroke) -> Option<&PaneKey> {
         self.pane_keys
             .iter()
             .find(|(bound, _)| typed_matches(typed, bound))
@@ -312,7 +348,6 @@ impl Keymap {
             .iter()
             .any(|prefix| typed_matches(typed, prefix))
     }
-
     /// The command a chord runs when `typed` follows the prefix.
     pub(crate) fn chord(&self, typed: &Keystroke) -> Option<Command> {
         COMMANDS
@@ -384,25 +419,19 @@ fn has_modifier(keystroke: &Keystroke) -> bool {
     modifiers.platform || modifiers.control || modifiers.alt || modifiers.function
 }
 
-/// Herdr documents `esc` and function keys as prefixes; any other bare key
-/// would swallow ordinary typing.
-fn usable_prefix(prefix: &Keystroke) -> bool {
-    has_modifier(prefix)
-        || prefix.key == "escape"
-        || prefix
-            .key
-            .strip_prefix('f')
-            .is_some_and(|number| number.parse::<u8>().is_ok())
-}
-
-/// The built-in pane keys, macOS only: Ghostty binds them there alone, and
-/// elsewhere the platform key belongs to the desktop.
-fn default_pane_keys() -> impl Iterator<Item = (Keystroke, Keystroke)> {
+/// The built-in pane keys. The line-editing chords are macOS only: Ghostty
+/// binds them there alone, and elsewhere the platform key belongs to the
+/// desktop.
+fn default_pane_keys() -> impl Iterator<Item = (Keystroke, PaneKey)> {
     DEFAULT_PANE_KEYS
         .iter()
         .filter(|_| cfg!(target_os = "macos"))
+        .chain(PORTABLE_PANE_KEYS)
         .filter_map(|(typed, sent)| {
-            Some((Keystroke::parse(typed).ok()?, Keystroke::parse(sent).ok()?))
+            Some((
+                Keystroke::parse(typed).ok()?,
+                PaneKey::Key(Keystroke::parse(sent).ok()?),
+            ))
         })
 }
 
@@ -410,10 +439,10 @@ fn default_pane_keys() -> impl Iterator<Item = (Keystroke, Keystroke)> {
 /// differently still replaces its default, and an empty value removes it.
 fn resolve_pane_keys(
     table: &PaneKeys,
-    defaults: impl IntoIterator<Item = (Keystroke, Keystroke)>,
-) -> Result<Vec<(Keystroke, Keystroke)>> {
+    defaults: impl IntoIterator<Item = (Keystroke, PaneKey)>,
+) -> Result<Vec<(Keystroke, PaneKey)>> {
     if table.len() > MAX_PANE_KEYS {
-        return Err(Error::TooManyPaneKeys(MAX_PANE_KEYS));
+        return Err(Error::TooManyPaneKeys(MAX_PANE_KEYS).into());
     }
     let parse = |keystroke: &str| {
         Keystroke::parse(keystroke).map_err(|source| Error::InvalidPaneKey {
@@ -428,12 +457,27 @@ fn resolve_pane_keys(
         // A bare character or space is typing, which must reach the pane as text.
         if !has_modifier(&parsed) && (parsed.key.chars().nth(1).is_none() || parsed.key == "space")
         {
-            return Err(Error::PaneKeyWithoutModifier(typed.clone()));
+            return Err(Error::PaneKeyWithoutModifier(typed.clone()).into());
         }
         if !seen.insert(identity(&parsed)) {
-            return Err(Error::DuplicatePaneKey(typed.clone()));
+            return Err(Error::DuplicatePaneKey(typed.clone()).into());
         }
         resolved.retain(|(bound, _)| identity(bound) != identity(&parsed));
+        // Text is sent as written, spaces included.
+        if let Some(text) = sent.strip_prefix(TEXT_PREFIX) {
+            if text.is_empty() {
+                return Err(Error::EmptyPaneKeyText(typed.clone()).into());
+            }
+            if text.len() > MAX_PANE_TEXT {
+                return Err(Error::PaneKeyTextTooLong {
+                    keystroke: typed.clone(),
+                    limit: MAX_PANE_TEXT,
+                }
+                .into());
+            }
+            resolved.push((parsed, PaneKey::Text(text.to_owned())));
+            continue;
+        }
         let sent = sent.trim();
         if sent.is_empty() {
             continue;
@@ -443,9 +487,10 @@ fn resolve_pane_keys(
             return Err(Error::UnsendablePaneKey {
                 from: typed.clone(),
                 to: sent.to_owned(),
-            });
+            }
+            .into());
         }
-        resolved.push((parsed, sent_parsed));
+        resolved.push((parsed, PaneKey::Key(sent_parsed)));
     }
     Ok(resolved)
 }
@@ -465,7 +510,8 @@ fn parse(command: &'static str, keystroke: &str) -> Result<Keystroke> {
         return Err(Error::KeystrokeWithoutModifier {
             command,
             keystroke: keystroke.to_owned(),
-        });
+        }
+        .into());
     }
     Ok(parsed)
 }

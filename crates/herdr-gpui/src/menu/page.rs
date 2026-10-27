@@ -3,74 +3,109 @@
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Page {
-    Menu,
-    /// The Linux window's application menu, from the native menu definitions.
-    Application,
+    // keep-sorted start
     About,
-    Preferences,
-    Devices,
-    /// Local sessions and remote devices, with the state of each.
-    Sessions,
-    /// Plan usage details for one agent on the selected host.
-    Usage(crate::usage::Provider),
-    AddDevice,
-    /// A saved SSH device's context menu, from its sidebar host header.
-    Host,
-    RenameDevice,
-    /// Names a saved SSH device's port to forward to this computer.
-    ForwardPort,
-    RemoveDevice,
+    /// A cloud provider in the Add Device rail whose machines are set up in
+    /// Settings rather than in the dialog.
+    #[cfg(feature = "cloud")]
+    AddCloud(crate::cloud::CloudProvider),
     /// Sign in to Coder and add one of its workspaces as a device.
     #[cfg(feature = "coder")]
     AddCoder,
+    AddDevice,
+    /// Add Device's tiles of the cloud providers its rail leaves out.
+    #[cfg(feature = "cloud")]
+    AddProvider,
     /// Picking a WSL distribution to save as a device.
     AddWsl,
-    /// Confirming a saved WSL distribution should be forgotten.
-    RemoveWsl,
-    Keybinds,
-    Themes,
-    Fonts,
-    Palette,
+    /// The one-time offer to install the agent skill for browser tabs.
+    AgentSkill,
+    /// The Linux window's application menu, from the native menu definitions.
+    Application,
+    AppUpdate,
+    /// Approving an automation script, or enabling automations on a host.
+    Automation,
+    /// Reviewing, then following, a move of the pane menu's pane to another
+    /// device.
+    CarryPane,
+    /// A checkout's agent checkpoints, and restoring one.
+    Checkpoints,
     /// Go to Symbol and Go to File over the focused pane's checkout.
     CodeSearch,
     ConfirmClose,
-    Update,
-    AppUpdate,
-    Install,
-    /// A daemon refused the handshake until one side is updated.
-    VersionMismatch,
-    /// The one-time offer to install the agent skill for browser tabs.
-    AgentSkill,
-    Tab,
-    RenameTab,
-    /// A group's "…" menu: opening tabs other than a terminal, closing
-    /// tabs, and splitting.
-    Group,
-    Pane,
-    RenamePane,
-    /// The processes under the pane menu's pane.
-    PaneProcesses,
-    /// Confirming the processes chosen there should end.
-    KillProcesses,
-    Workspace,
-    GitHub,
+    /// Confirming new cloud machines a command asked for should be made.
+    #[cfg(feature = "cloud")]
+    CreateCloud,
+    /// Confirming saved cloud devices a command named should be destroyed.
+    #[cfg(feature = "cloud")]
+    DestroyCloud,
+    Devices,
+    /// Picks a saved SSH device's terminal theme.
+    DeviceTheme,
+    Dialog(WorkspaceAction),
+    /// One prompt sent to several agents, and their comparison.
+    FanOut,
+    /// Names a saved SSH device's port to forward to this computer.
+    ForwardPort,
     /// Titlebar Git actions for the focused checkout, and its commit dialog.
     Git,
     GitCommit,
-    /// The open pull request's checks and review conversation.
-    PrReview,
+    GitHub,
+    /// A group's "…" menu: opening tabs other than a terminal, closing
+    /// tabs, and splitting.
+    Group,
+    /// A saved SSH device's context menu, from its sidebar host header.
+    Host,
+    Install,
+    Keybinds,
+    /// Confirming the processes chosen there should end.
+    KillProcesses,
+    Menu,
+    /// Where the pane menu's pane can move: new places, then other tabs.
+    MovePane,
+    /// Where the tab menu's tab can move: a new workspace, then other workspaces.
+    MoveTab,
+    /// Asks before opening a workspace for a checkout a link named.
+    OpenCheckout,
+    /// Asks before opening a terminal hyperlink with an unlisted scheme.
+    OpenLink,
+    Palette,
+    Pane,
+    /// The processes under the pane menu's pane.
+    PaneProcesses,
     PrComment,
     /// Choosing a merge method, and confirming it.
     PrMerge,
-    Dialog(WorkspaceAction),
+    /// The open pull request's checks and review conversation.
+    PrReview,
+    /// Pairing a phone for remote control: the QR, then the approval.
+    RemoteControl,
+    /// The title bar's list of paired phones, to disconnect one or pair
+    /// another.
+    RemoteDevices,
+    RemoveDevice,
+    /// Confirming a saved WSL distribution should be forgotten.
+    RemoveWsl,
+    RenameDevice,
+    RenamePane,
+    RenameTab,
+    /// Confirming a paired remote control device should be revoked.
+    RevokeDevice,
+    /// Local sessions and remote devices, with the state of each.
+    Sessions,
+    Tab,
     /// Moving a linked worktree to another host.
     Teleport,
-    /// A checkout's agent checkpoints, and restoring one.
-    Checkpoints,
-    /// One prompt sent to several agents, and their comparison.
-    FanOut,
+    Themes,
+    Update,
+    /// Plan usage details for one agent on the selected host.
+    Usage(crate::usage::Provider),
+    /// A daemon refused the handshake until one side is updated.
+    VersionMismatch,
+    Workspace,
     /// Asks whether to trust a repository's worktree script before it runs.
     WorktreeScript,
+    // keep-sorted end
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,8 +144,11 @@ pub(crate) enum WorkspaceMenuAction {
     FanOut,
     /// Run one of the repository's worktree scripts in a new tab.
     Script(crate::worktree_scripts::ScriptKind),
-    /// Open the repository's orchestrator tab.
+    /// Show the repository's issues in the activity bar.
     Orchestrator,
+    /// Build the repository's sandbox images ahead of a dispatch.
+    #[cfg(feature = "cloud")]
+    SandboxImages,
 }
 
 impl Page {
@@ -122,9 +160,12 @@ impl Page {
             Self::Workspace
                 | Self::Tab
                 | Self::RenameTab
+                | Self::MoveTab
                 | Self::Group
                 | Self::Pane
                 | Self::RenamePane
+                | Self::MovePane
+                | Self::CarryPane
                 | Self::PaneProcesses
                 | Self::KillProcesses
                 | Self::Host
@@ -132,9 +173,23 @@ impl Page {
                 | Self::RemoveWsl
                 | Self::Git
                 | Self::GitCommit
+                | Self::RemoteDevices
                 | Self::PrReview
                 | Self::PrComment
                 | Self::PrMerge
+        )
+    }
+
+    /// The pane menu and the pages it opens, all about its one pane.
+    pub(crate) fn pane_menu(self) -> bool {
+        matches!(
+            self,
+            Self::Pane
+                | Self::RenamePane
+                | Self::MovePane
+                | Self::CarryPane
+                | Self::PaneProcesses
+                | Self::KillProcesses
         )
     }
 }
@@ -161,6 +216,8 @@ impl WorkspaceMenuAction {
             Self::Checkpoints => "icons/refresh.svg",
             Self::FanOut => "icons/fan-out.svg",
             Self::Orchestrator => "icons/github.svg",
+            #[cfg(feature = "cloud")]
+            Self::SandboxImages => "icons/cloud/container.svg",
             Self::Script(crate::worktree_scripts::ScriptKind::Setup) => "icons/refresh.svg",
             Self::Script(_) => "icons/play.svg",
             Self::PullRequest => return None,

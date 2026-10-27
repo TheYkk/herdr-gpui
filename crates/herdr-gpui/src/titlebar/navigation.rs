@@ -2,8 +2,15 @@
 //! own toolbars draw them. Only the look differs; every platform walks the
 //! same focus trail (`endpoint::history`).
 
-use crate::{HerdrWindow, config::corners, endpoint::Step};
+use crate::{HerdrWindow, config::corners, endpoint::Step, titlebar::SIDEBAR_TOGGLE_INSET};
 use gpui::{prelude::*, *};
+
+/// Visible room the pair keeps on each side, so it sits the same distance
+/// from the sidebar toggle's glyph before it and the tabs after it on every
+/// platform.
+pub(super) const NAVIGATION_MARGIN: f32 = 11.;
+/// The toggle's own inset already provides part of the room before the pair.
+const LEADING_MARGIN: f32 = NAVIGATION_MARGIN - SIDEBAR_TOGGLE_INSET;
 
 /// A platform's toolbar convention for the pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,12 +47,13 @@ impl Style {
     /// The pair's whole width, margins and divider included.
     pub(crate) fn width(self) -> f32 {
         let button = f32::from(self.button().0.width);
-        match self {
-            // 2px lead, the bezel's 1px border on each side, and the hairline.
-            Self::Segmented => 2. + 2. + 1. + 2. * button,
+        let pair = match self {
+            // The bezel's 1px border on each side, and the hairline.
+            Self::Segmented => 2. + 1. + 2. * button,
             Self::Fluent => 4. + 2. * button,
             Self::Adwaita => 6. + 2. * button,
-        }
+        };
+        LEADING_MARGIN + pair + NAVIGATION_MARGIN
     }
 
     fn icon(self, step: Step) -> &'static str {
@@ -84,6 +92,13 @@ impl HerdrWindow {
             div()
                 .id(id)
                 .debug_selector(move || id.into())
+                .role(Role::Button)
+                .aria_label(label)
+                // With no history that way it is unavailable, and Tab skips it.
+                .map(|control| crate::accessibility::disabled(control, !enabled))
+                .when(enabled, |control| {
+                    self.chrome_stop(crate::window::chrome_focus::Region::TitleBar, control)
+                })
                 .flex()
                 .flex_none()
                 .items_center()
@@ -123,8 +138,11 @@ impl HerdrWindow {
                         })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.travel(step, cx);
-                            window.focus(&this.focus, cx);
+                            this.travel(step, window, cx);
+                            // A section returned to keeps the keyboard it took.
+                            if this.activity_section().is_none() {
+                                window.focus(&this.focus, cx);
+                            }
                         }))
                 })
         };
@@ -133,10 +151,11 @@ impl HerdrWindow {
             .flex()
             .flex_none()
             .items_center()
-            .self_center();
+            .self_center()
+            .ml(px(LEADING_MARGIN))
+            .mr(px(NAVIGATION_MARGIN));
         match style {
             Style::Segmented => pair
-                .ml(px(2.))
                 .rounded(px(style.button().1))
                 .overflow_hidden()
                 .bg(wash(ink, 0x0f))

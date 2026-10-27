@@ -2,6 +2,10 @@
 use super::Action;
 use gpui::TestAppContext;
 
+mod accounts;
+mod github_cli;
+mod installation;
+
 #[gpui::test]
 fn successful_signin_dismisses_only_the_signin_panel_and_restores_focus(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(crate::sidebar::layout_tests::fixture_window);
@@ -37,7 +41,7 @@ fn successful_signin_dismisses_only_the_signin_panel_and_restores_focus(cx: &mut
             view.github_fixture(false, window, cx);
             view.menu
                 .github
-                .complete_profile_fixture(Err(crate::Error::GitHubAuthentication));
+                .complete_profile_fixture(Err(herdr_github::Error::Authentication));
             view.poll_github(window, cx);
             assert!(view.menu.page == Some(crate::menu::Page::GitHub));
             assert!(!view.menu.github.connected());
@@ -182,7 +186,8 @@ fn connected_panel_is_content_sized_with_only_header_close(cx: &mut TestAppConte
         let avatar = cx.debug_bounds("github-avatar").unwrap();
         assert_eq!(mark.size, gpui::size(gpui::px(28.), gpui::px(28.)));
         assert_eq!(avatar.size, gpui::size(gpui::px(40.), gpui::px(40.)));
-        cx.simulate_keystrokes("tab tab enter");
+        // Sign out, Add account, then Close.
+        cx.simulate_keystrokes("tab tab tab enter");
         cx.update(|window, cx| {
             assert!(view.read(cx).menu.page.is_none());
             assert!(view.read(cx).menu.github.connected());

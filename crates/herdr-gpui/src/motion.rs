@@ -2,7 +2,12 @@
 //! notes panel, notes. Each is a function of when it started and the time
 //! now, so a frame never depends on the one before it, and a view keeps
 //! drawing frames only while something is still moving.
+mod slow;
+
+use gpui::{AnimationElement, AnimationExt, ElementId, IntoElement, Styled, px};
 use std::time::{Duration, Instant};
+
+pub(crate) use slow::{duration, is_slow, now, set_slow};
 
 /// How long something takes to grow in.
 pub(crate) const ENTER: Duration = Duration::from_millis(180);
@@ -16,9 +21,28 @@ pub(crate) fn progress(since: Instant, now: Instant, length: Duration) -> Option
     (k < 1.).then(|| 1. - (1. - k.clamp(0., 1.)).powi(3))
 }
 
+/// How far a dropdown drops into place as it appears.
+const DROP: f32 = 4.;
+
+/// A dropdown or small popover appearing: it fades in while dropping a few
+/// pixels into place, on the same curve as [`progress`]. `id` names it; GPUI
+/// plays the motion again each time an element of that id appears anew.
+/// Unit tests see it in place, so geometry checks need not wait it out.
+pub(crate) fn pop_in<E: IntoElement + Styled + 'static>(
+    element: E,
+    id: impl Into<ElementId>,
+) -> AnimationElement<E> {
+    element.with_animation(
+        id,
+        gpui::Animation::new(duration(ENTER)).with_easing(|k| 1. - (1. - k).powi(3)),
+        |element, k| {
+            let k = if cfg!(test) { 1. } else { k };
+            element.opacity(k).mt(px(-(1. - k) * DROP))
+        },
+    )
+}
+
 /// Something that opens and closes, such as a panel: how much of it shows.
-/// Only the notes panel uses one, and only builds that show pages have it.
-#[cfg(any(target_os = "macos", windows, test))]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Toggle {
     open: bool,
@@ -27,7 +51,6 @@ pub(crate) struct Toggle {
     since: Option<Instant>,
 }
 
-#[cfg(any(target_os = "macos", windows, test))]
 impl Toggle {
     /// Opens or closes it at `now`. The first report sets where it is
     /// without moving, as a view first drawn shows what it has.
@@ -46,6 +69,11 @@ impl Toggle {
             self.open = open;
             self.since = Some(now.checked_sub(back).unwrap_or(now));
         }
+    }
+
+    /// Whether it is open or opening, rather than closed or closing.
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
     }
 
     /// How much of it shows at `now`, from 0 closed to 1 open.

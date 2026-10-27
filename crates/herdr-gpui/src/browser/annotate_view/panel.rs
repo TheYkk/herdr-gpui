@@ -6,7 +6,7 @@ use crate::{
     browser::annotate::{Anchor, Note},
 };
 use gpui::{prelude::*, *};
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 impl HerdrWindow {
     /// The notes panel beside the page.
@@ -33,10 +33,11 @@ impl HerdrWindow {
                 Some((note.anchor.summary(), note.image.clone(), false))
             });
         let list: Vec<(usize, Note)> = notes.notes.iter().cloned().enumerate().collect();
-        let unsent = list.iter().filter(|(_, note)| !note.sent).count();
+        let unsent = list.iter().filter(|(_, note)| note.sent.is_none()).count();
         let send_label = crate::agent_notes::send_label(list.len(), unsent);
         let any_sent = unsent < list.len();
-        let now = Instant::now();
+        let queued = self.queued_notes(id, cx);
+        let now = crate::motion::now();
         self.browser.annotations.observe_notes(id, list.len(), now);
         let origin = tab.origin.is_some();
         let tab_for_send = tab.clone();
@@ -119,7 +120,7 @@ impl HerdrWindow {
             .map(|index| self.browser.annotations.note_growth(id, index, now))
             .collect();
         let rows = list.into_iter().map(|(index, note)| {
-            let sent = note.sent;
+            let sent = note.sent.is_some();
             div()
                 .id(("annotation-note", index))
                 // A new note opens into the list and fades in.
@@ -167,6 +168,11 @@ impl HerdrWindow {
                                 .id(("annotation-edit", index))
                                 .debug_selector(move || format!("annotation-edit-{index}"))
                                 .cursor_text()
+                                // A page's result arrives without a note.
+                                .when(note.comment.is_empty(), |hint| {
+                                    hint.text_color(rgb(theme.muted))
+                                        .child("Add a note\u{2026}")
+                                })
                                 .child(note.comment)
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.edit_note(id, index, window, cx);
@@ -251,22 +257,40 @@ impl HerdrWindow {
                         )
                     }),
             )
-            .when(has_notes, |panel| {
+            // A queued batch stays withdrawable after Clear sent empties the
+            // list.
+            .when(has_notes || queued.is_some(), |panel| {
                 panel.child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap_1()
                         .p_2()
                         .border_t_1()
                         .border_color(rgb(theme.active))
-                        .when(origin, |row| {
+                        .when_some(queued, |row, queued| {
+                            row.child(
+                                div()
+                                    .id("annotation-queued")
+                                    .debug_selector(|| "annotation-queued".into())
+                                    .w_full()
+                                    .text_color(rgb(theme.muted))
+                                    .child(queued.label()),
+                            )
+                            .child(button("annotation-withdraw", "Withdraw".into(), true).on_click(
+                                cx.listener(move |this, _, _, cx| this.withdraw_notes(id, cx)),
+                            ))
+                        })
+                        .when(origin && queued.is_none(), |row| {
                             row.child(button("annotation-send", send_label.into(), true).on_click(
                                 cx.listener(move |this, _, _, cx| this.send_notes(&tab_for_send, cx)),
                             ))
                         })
-                        .child(button("annotation-copy", "Copy".into(), !origin).on_click(
-                            cx.listener(move |this, _, _, cx| this.copy_notes(&tab_for_copy, cx)),
-                        ))
+                        .when(has_notes, |row| {
+                            row.child(button("annotation-copy", "Copy".into(), !origin).on_click(
+                                cx.listener(move |this, _, _, cx| this.copy_notes(&tab_for_copy, cx)),
+                            ))
+                        })
                         .when(any_sent, |row| {
                             row.child(
                                 button("annotation-clear-sent", "Clear sent".into(), false).on_click(

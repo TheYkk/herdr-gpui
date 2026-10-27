@@ -9,7 +9,7 @@
 mod rank;
 mod render;
 
-pub(crate) use rank::Mode;
+pub(crate) use rank::{Mode, Query, rank};
 
 use crate::{
     HerdrWindow,
@@ -19,7 +19,7 @@ use crate::{
     search_input::{Changed, SearchInput},
 };
 use gpui::{prelude::*, *};
-use rank::{Hit, Query};
+use rank::Hit;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -161,7 +161,7 @@ impl HerdrWindow {
         };
         match cwd.filter(|_| !self.selected_is_remote()) {
             Some(cwd) => self.locate_checkout(&code, cwd, cx),
-            None => code.status = Status::Failed(crate::Error::CodeIndexRoot.to_string()),
+            None => code.status = Status::Failed(code_index::Error::Root.to_string()),
         }
         self.menu.code_search = Some(code);
         cx.notify();
@@ -173,7 +173,7 @@ impl HerdrWindow {
         let token = code.search.clone();
         let found = cx
             .background_executor()
-            .spawn(async move { code_index::checkout_root(&cwd, &cancelled) });
+            .spawn(async move { Ok(code_index::checkout_root(&cwd, &cancelled)?) });
         cx.spawn(async move |this, cx| {
             let root = found.await;
             let _ = this.update(cx, |this, cx| {
@@ -215,7 +215,7 @@ impl HerdrWindow {
             let token = code.search.clone();
             let built = cx
                 .background_executor()
-                .spawn(async move { Index::build(&root, &cancelled).map(Arc::new) });
+                .spawn(async move { Ok(Index::build(&root, &cancelled).map(Arc::new)?) });
             cx.spawn(async move |this, cx| {
                 let index = built.await;
                 let _ = this.update(cx, |this, cx| this.checkout_indexed(&token, index, cx));
@@ -285,7 +285,7 @@ impl HerdrWindow {
         let ranked = index.clone();
         let ranking = cx
             .background_executor()
-            .spawn(async move { rank::rank(&ranked, mode, &query) });
+            .spawn(async move { rank(&ranked, mode, &query) });
         code.rank_task = Some(cx.spawn(async move |this, cx| {
             let hits = ranking.await;
             let _ = this.update(cx, |this, cx| {

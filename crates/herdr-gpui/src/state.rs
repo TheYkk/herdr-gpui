@@ -5,6 +5,7 @@ use herdr_client::{
 use std::sync::Arc;
 
 mod agent_recency;
+mod projection;
 
 use agent_recency::AgentRecency;
 
@@ -61,6 +62,8 @@ pub struct LiveState {
     pub(crate) sound_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) sound_connection_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub snapshot: Option<Arc<ClientShellSnapshot>>,
+    /// One newer metadata projection, waiting for its matching cells.
+    pub(crate) pending_snapshot: Option<Arc<ClientShellSnapshot>>,
     /// When each of `snapshot`'s agents last changed, on a clock shared with
     /// every other connection, so the agents panel can merge hosts by recency.
     pub(crate) agent_recency: AgentRecency,
@@ -70,11 +73,14 @@ pub struct LiveState {
     pub surface: Option<Arc<PaneSurfaceFrame>>,
     /// Pixels for the images the connection's surfaces place, by asset key.
     pub(crate) surface_images: Arc<SurfaceImages>,
+    pub(crate) pending_surface_images: Option<Arc<SurfaceImages>>,
     pub status: ConnectionStatus,
     pub error: Option<String>,
     /// Why `ssh` refused the bridge, when that is how the connection ended.
     pub(crate) ssh_failure: Option<herdr_client::SshFailure>,
     pub missing_installation: bool,
+    /// The daemon's reported version, from an accepted handshake or mismatch notice.
+    pub daemon_version: Option<String>,
     /// Why the last handshake was refused, when updating one side fixes it.
     /// Cleared by the next accepted handshake.
     pub version_mismatch: Option<herdr_client::VersionMismatch>,
@@ -88,6 +94,9 @@ pub struct LiveState {
     /// `tab.move` reorders a workspace's tabs; daemons that do not offer it
     /// to clients keep their tabs where they are.
     pub(crate) supports_tab_move: bool,
+    /// `workspace.move` takes a single workspace; without it a drop sends
+    /// every reorder as `workspace.move_block`.
+    pub(crate) supports_workspace_move: bool,
     /// `pane.link.resolve` and `pane.link.activate` let the daemon find links
     /// across wrapped rows and run plugin link handlers; without them links
     /// are found row by row here and always opened by this client.
@@ -110,6 +119,9 @@ pub struct LiveState {
     /// The `pane.split` an editor pane is waiting on, in its own slot for
     /// the same reason. Cleared from the mailbox once the job has read it.
     pub(crate) editor_response: Option<(String, Option<DialogResponse>)>,
+    /// The `worktree.remove` a merged worktree cleanup is waiting on, in its
+    /// own slot so it and an open dialog cannot take each other's answer.
+    pub(crate) cleanup_response: Option<(String, Option<DialogResponse>)>,
     pub(crate) notifications: std::collections::VecDeque<crate::notifications::Notice>,
     pub(crate) notifications_lost: bool,
     outer_focused: Option<bool>,
@@ -182,20 +194,24 @@ impl Default for LiveState {
             sound_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sound_connection_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             snapshot: None,
+            pending_snapshot: None,
             agent_recency: AgentRecency::default(),
             previous_pane: None,
             surface: None,
             surface_images: Default::default(),
+            pending_surface_images: None,
             status: ConnectionStatus::Connecting,
             error: None,
             ssh_failure: None,
             missing_installation: false,
+            daemon_version: None,
             version_mismatch: None,
             local_daemon_peer: false,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             local_peer_warning: None,
             supports_pane_clear: false,
             supports_tab_move: false,
+            supports_workspace_move: false,
             supports_link_resolve: false,
             supports_link_activate: false,
             supports_copy_search: false,
@@ -206,6 +222,7 @@ impl Default for LiveState {
             dialog_response: None,
             script_response: None,
             editor_response: None,
+            cleanup_response: None,
             notifications: Default::default(),
             notifications_lost: false,
             keyboard_report_all: false,
@@ -237,21 +254,25 @@ impl LiveState {
             sound_cancel,
             sound_connection_cancel,
             snapshot,
+            pending_snapshot: _,
             // Changes only with `snapshot`, which is compared below.
             agent_recency: _,
             previous_pane,
             surface: _,
             surface_images: _,
+            pending_surface_images: _,
             status,
             error,
             ssh_failure,
             missing_installation,
+            daemon_version,
             version_mismatch,
             local_daemon_peer,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             local_peer_warning,
             supports_pane_clear,
             supports_tab_move,
+            supports_workspace_move,
             supports_link_resolve,
             supports_link_activate,
             supports_copy_search,
@@ -262,6 +283,7 @@ impl LiveState {
             dialog_response,
             script_response,
             editor_response,
+            cleanup_response,
             notifications,
             notifications_lost,
             outer_focused,
@@ -304,10 +326,12 @@ impl LiveState {
             && *error == self.error
             && *ssh_failure == self.ssh_failure
             && *missing_installation == self.missing_installation
+            && *daemon_version == self.daemon_version
             && *version_mismatch == self.version_mismatch
             && *local_daemon_peer == self.local_daemon_peer
             && *supports_pane_clear == self.supports_pane_clear
             && *supports_tab_move == self.supports_tab_move
+            && *supports_workspace_move == self.supports_workspace_move
             && *supports_link_resolve == self.supports_link_resolve
             && *supports_link_activate == self.supports_link_activate
             && *supports_copy_search == self.supports_copy_search
@@ -323,6 +347,10 @@ impl LiveState {
                 (a, b) => a.is_none() && b.is_none(),
             }
             && match (editor_response, &self.editor_response) {
+                (Some((a, None)), Some((b, None))) => a == b,
+                (a, b) => a.is_none() && b.is_none(),
+            }
+            && match (cleanup_response, &self.cleanup_response) {
                 (Some((a, None)), Some((b, None))) => a == b,
                 (a, b) => a.is_none() && b.is_none(),
             }
@@ -354,6 +382,7 @@ impl LiveState {
             &self.dialog_response,
             &self.script_response,
             &self.editor_response,
+            &self.cleanup_response,
         ]
         .into_iter()
         .flatten()
@@ -442,6 +471,29 @@ impl LiveState {
         }
     }
 
+    /// The daemon's reported version from an active connection or mismatch notice.
+    pub fn daemon_version(&self) -> Option<&str> {
+        self.daemon_version.as_deref().or_else(|| {
+            self.version_mismatch
+                .as_ref()
+                .and_then(|m| m.server_version())
+        })
+    }
+
+    /// What the daemon reports of the agent in `pane_id`, while one runs there.
+    pub(crate) fn agent_status(
+        &self,
+        pane_id: &str,
+    ) -> Option<herdr_client::protocol::AgentStatus> {
+        self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.pane_id == pane_id)
+                .map(|agent| agent.agent_status)
+        })
+    }
+
     /// Track activation without treating receipt or focus gain as presentation.
     pub fn set_outer_focus(&mut self, focused: bool) {
         // A focus report retried after inbox contention must still cause a draw.
@@ -453,8 +505,11 @@ impl LiveState {
         match event {
             ClientEvent::Connected(welcome) => {
                 self.settings_reload = false;
+                self.daemon_version = sanitize_daemon_version(&welcome.server_version);
                 self.supports_pane_clear = Method::PaneClear.advertised_in(&welcome.methods);
                 self.supports_tab_move = Method::TabMove.advertised_in(&welcome.methods);
+                self.supports_workspace_move =
+                    Method::WorkspaceMove.advertised_in(&welcome.methods);
                 self.supports_announcement_dismiss =
                     Method::ProductAnnouncementDismiss.advertised_in(&welcome.methods);
                 self.supports_release_notes_dismiss =
@@ -483,72 +538,16 @@ impl LiveState {
                 self.status = ConnectionStatus::AwaitingSnapshot;
                 self.error = None;
             }
-            ClientEvent::Snapshot(snapshot) => {
-                if self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|old| old.boot_id != snapshot.boot_id)
-                {
-                    self.notifications.clear();
-                    self.cancel_sounds();
-                    self.sound_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    // A restarted daemon pushes its own title; the old one's
-                    // must not outlive it.
-                    self.bells = 0;
-                    self.window_title = None;
-                }
-                if let Some(activation) = &mut self.activation
-                    && activation.boot != snapshot.boot_id
-                {
-                    activation.failed = true;
-                }
-                self.missing_installation = false;
-                if self
-                    .surface
-                    .as_ref()
-                    .is_some_and(|s| !coherent(&snapshot, s))
-                {
-                    self.surface = None;
-                }
-                // Once the daemon drops or replaces the announcement there is
-                // nothing left to hide.
-                if self
-                    .announcement_dismissal
-                    .as_ref()
-                    .is_some_and(|dismissal| !dismissal.covers(&snapshot))
-                {
-                    self.announcement_dismissal = None;
-                }
-                self.status = ConnectionStatus::Connected;
-                // Pane IDs are only meaningful within one daemon boot.
-                self.previous_pane = match &self.snapshot {
-                    Some(old) if old.boot_id == snapshot.boot_id => old
-                        .focused_pane_id
-                        .clone()
-                        .filter(|old| Some(old) != snapshot.focused_pane_id.as_ref())
-                        .or_else(|| self.previous_pane.take()),
-                    _ => None,
-                };
-                // Pane IDs, and so each agent's history, belong to one boot.
-                let previous = self
-                    .snapshot
-                    .as_deref()
-                    .filter(|old| old.boot_id == snapshot.boot_id);
-                self.agent_recency.observe(previous, &snapshot);
-                self.snapshot = Some(snapshot);
-            }
-            ClientEvent::Surface(surface) => {
-                if self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|s| coherent(s, &surface))
-                {
-                    self.surface = Some(surface);
-                }
-            }
-            ClientEvent::SurfaceImages(images) => self.surface_images = images,
+            ClientEvent::Snapshot(snapshot) => self.receive_snapshot(snapshot),
+            ClientEvent::Surface(surface) => self.receive_surface(surface),
+            ClientEvent::SurfaceImages(images) => self.receive_surface_images(images),
             // The `Disconnected` that follows carries the reason text.
-            ClientEvent::VersionMismatch(mismatch) => self.version_mismatch = Some(mismatch),
+            ClientEvent::VersionMismatch(mismatch) => {
+                if let Some(version) = mismatch.server_version() {
+                    self.daemon_version = sanitize_daemon_version(version);
+                }
+                self.version_mismatch = Some(mismatch);
+            }
             ClientEvent::Disconnected { reason, ssh } => {
                 self.ssh_failure = ssh;
                 self.settings_reload = false;
@@ -560,6 +559,8 @@ impl LiveState {
                 self.status = ConnectionStatus::Disconnected;
                 self.error = Some(reason);
                 self.snapshot = None;
+                self.pending_snapshot = None;
+                self.pending_surface_images = None;
                 self.agent_recency = AgentRecency::default();
                 self.surface = None;
                 self.announcement_dismissal = None;
@@ -580,6 +581,7 @@ impl LiveState {
                     &mut self.dialog_response,
                     &mut self.script_response,
                     &mut self.editor_response,
+                    &mut self.cleanup_response,
                 ]
                 .into_iter()
                 .flatten()
@@ -623,7 +625,7 @@ impl LiveState {
                         rename.result = Some(
                             match response.get("error").filter(|error| !error.is_null()) {
                                 Some(error) => {
-                                    Err(Arc::new(crate::Error::DaemonResponse(error.clone())))
+                                    Err(Arc::new(crate::daemon::Error::Response(error.clone()).into()))
                                 }
                                 None => Ok(()),
                             },
@@ -648,15 +650,19 @@ impl LiveState {
                     && !error.is_null()
                     && !self.has_operation_result(&request_id)
                 {
-                    self.error = Some(crate::Error::DaemonResponse(error.clone()).to_string());
+                    self.error = Some(crate::daemon::Error::Response(error.clone()).to_string());
                 }
                 if self.dismissal_request(&request_id)
                     && response.get("error").is_some_and(|error| !error.is_null())
                 {
                     self.announcement_dismissal = None;
                 }
-                for (id, result) in [&mut self.script_response, &mut self.editor_response]
-                    .into_iter()
+                for (id, result) in [
+                    &mut self.script_response,
+                    &mut self.editor_response,
+                    &mut self.cleanup_response,
+                ]
+                .into_iter()
                     .flatten()
                 {
                     if *id == request_id {
@@ -691,10 +697,9 @@ impl LiveState {
                     // A dropped event may have invalidated an already displayed pane.
                     self.notifications_lost = true;
                 }
-                self.notifications.push_back(
-                    crate::notifications::Notice::new(notification, received)
-                        .with_snapshot(self.snapshot.as_deref()),
-                );
+                let notice = crate::notifications::Notice::new(notification, received)
+                    .with_snapshot(self.latest_snapshot().map(Arc::as_ref));
+                self.notifications.push_back(notice);
             }
             ClientEvent::Message(ServerMessage::ReloadSoundConfig) => {
                 self.reload_sound = true;
@@ -796,6 +801,19 @@ fn sanitize_window_title(title: &str) -> Option<String> {
         .collect::<String>();
     let title = title.trim();
     (!title.is_empty()).then(|| title.to_owned())
+}
+
+/// Maximum characters kept for a daemon version string.
+pub(crate) const MAX_DAEMON_VERSION_CHARS: usize = 64;
+
+fn sanitize_daemon_version(version: &str) -> Option<String> {
+    let version = version
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_DAEMON_VERSION_CHARS)
+        .collect::<String>();
+    let version = version.trim();
+    (!version.is_empty()).then(|| version.to_owned())
 }
 
 fn coherent(snapshot: &ClientShellSnapshot, surface: &PaneSurfaceFrame) -> bool {

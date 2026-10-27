@@ -4,13 +4,18 @@
 //! unparseable entry, a `hyper` modifier, an action with no GUI command) is
 //! skipped rather than turned into a GUI config error.
 //!
-//! Herdr actions with no GUI command, each for a reason:
-//! - `open_worktree` and `remove_worktree`: the workspace menu offers both,
-//!   but each needs a menu row as the target, not just the focused one.
-//! - `navigate_pane_*`: the workspace picker is a search field here, with no
-//!   pane cursor to move.
+//! `open_worktree` and `remove_worktree` act on the focused workspace, as in
+//! the TUI, by opening the dialog that workspace's menu row would open; when
+//! it has no such row, a flash says why.
+//!
+//! Herdr's `navigate_pane_*` keys have no GUI command: the workspace picker
+//! is a search field here, with no pane cursor to move.
 
-use crate::{Error, Result, controls::Command};
+mod error;
+
+pub(crate) use error::Error;
+
+use crate::{Result, controls::Command};
 use gpui::{Keystroke, Modifiers};
 
 /// Herdr's own fallback when `prefix` is missing or names no usable key.
@@ -76,6 +81,13 @@ const ACTIONS: &[(&str, Target, &str)] = &[
         "new_worktree",
         Target::Command(Command::NewWorktree),
         "prefix+shift+g",
+    ),
+    // Herdr leaves both unbound.
+    ("open_worktree", Target::Command(Command::OpenWorktree), ""),
+    (
+        "remove_worktree",
+        Target::Command(Command::RemoveWorktree),
+        "",
     ),
     (
         "workspace_picker",
@@ -288,17 +300,18 @@ impl DaemonKeys {
     /// profile that is missing or unreadable as a whole is an error, which
     /// leaves the caller on its local keybindings.
     pub(crate) fn from_profile(profile: Option<&str>) -> Result<Self> {
-        let profile = profile.ok_or(Error::ServerKeybindingsMissing)?;
+        let profile = profile.ok_or(Error::Missing)?;
         if profile.len() > MAX_PROFILE_BYTES {
-            return Err(Error::ServerKeybindingsTooLarge {
+            return Err(Error::TooLarge {
                 max: MAX_PROFILE_BYTES,
-            });
+            }
+            .into());
         }
-        let table: toml::Table = profile.parse().map_err(Error::ServerKeybindingsParse)?;
+        let table: toml::Table = profile.parse().map_err(Error::Parse)?;
         let keys = table
             .get("keys")
             .and_then(toml::Value::as_table)
-            .ok_or(Error::ServerKeybindingsNoKeys)?;
+            .ok_or(Error::NoKeys)?;
         Ok(Self::from_table(Some(keys)))
     }
 

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for looking at Herdr GPUI. This file covers the mechanics; the
+Thanks for looking at Herdr UI. This file covers the mechanics; the
 engineering rules that actually govern changes live in
 [AGENTS.md](AGENTS.md) — architecture boundaries, Rust conventions, and
 verification expectations. Read it before a non-trivial change. It applies to
@@ -8,10 +8,9 @@ human and agent contributors alike.
 
 ## Before You Start
 
-- **macOS and experimental Linux builds.** GPUI uses Metal on macOS and
-  Vulkan with X11/Wayland on Linux. CI/release builds cover Linux x86_64 and
-  ARM64; native Linux desktop verification is still pending. No Windows build
-  currently exists.
+- **macOS, Linux, and Windows builds.** GPUI uses Metal on macOS, Vulkan
+  with X11/Wayland on Linux, and DirectX on Windows. CI and release builds
+  cover x86_64 and ARM64 on Linux and Windows.
 - **You need Herdr installed.** This repository is a client of the
   daemon from [herdrdev/herdr](https://github.com/herdrdev/herdr). Normal local
   launches may start it if absent; explicit sockets remain attach-only. The GUI
@@ -92,7 +91,9 @@ parent Wayland socket without exposing its HOME or runtime directory to daemons.
   a `BREAKING CHANGE: <what breaks>` footer.
 - Run `just hooks` once per clone to install the `commit-msg` hook that checks
   this locally; CI checks it again for every commit in a pull request. Preview
-  the result with `just changelog-unreleased`.
+  the result with `just changelog-unreleased`. The same recipe enables
+  `rerere` and a `Cargo.lock` merge driver; see Parallel Pull Requests in
+  `AGENTS.md`.
 - `main` requires a pull request and green CI. Review your own full diff
   against the base before marking it ready.
 - State the validation you actually ran, and say plainly which native or

@@ -9,7 +9,7 @@ impl HerdrWindow {
         let id = "installed-provider-test".to_owned();
         scope.inbox.lock().unwrap().pending = Some((id.clone(), Some(Ok(response))));
         self.integrations.scope = Some(scope);
-        self.integrations.pending = Some((id, Operation::List));
+        self.integrations.pending = Some((id, Operation::List(Method::IntegrationList)));
         self.integrations.busy = true;
     }
 }

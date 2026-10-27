@@ -2,14 +2,17 @@
 //! ordered surface barrier so input cannot reach the previous pane while the
 //! navigation and its projection are still in flight.
 
-use super::{Flash, HerdrWindow};
+use super::{Flash, HerdrWindow, layout_save::LayoutSaves};
 use crate::{
     app::InitialAppearance,
-    config::{Config, FONT_SIZE_RANGE, FONT_SIZE_STEP, LayoutMode},
+    config::{
+        ChatLayoutMode, Config, FONT_SIZE_RANGE, FONT_SIZE_STEP, LayoutMode, TabLayoutMode,
+        preferences::Preference,
+    },
     controls::{self, Command},
     endpoint::Step,
     log_window,
-    menu::WorkspaceAction,
+    menu::{WorkspaceAction, WorktreeShortcut},
     navigation::{NavigationTarget, OwnedNavigationTarget},
     open_additional_window, state,
 };
@@ -42,7 +45,11 @@ impl HerdrWindow {
         }
         crate::menus::install(cx);
         cx.notify();
-        let save = cx.background_executor().spawn(async move { save(mode) });
+        let saves = cx.default_global::<LayoutSaves>().sidebar.clone();
+        saves.want(mode);
+        let save = cx
+            .background_executor()
+            .spawn(async move { saves.write_latest(save) });
         cx.spawn(async move |_, _| {
             if let Err(error) = save.await {
                 tracing::warn!(%error, "Could not save the sidebar layout");
@@ -51,6 +58,87 @@ impl HerdrWindow {
         .detach();
     }
 
+    /// Switches how tab strips draw their tabs, then keeps it as
+    /// [`Self::set_layout`] keeps the sidebar's.
+    pub(crate) fn set_tab_layout(&mut self, mode: TabLayoutMode, cx: &mut Context<Self>) {
+        self.set_tab_layout_with(
+            mode,
+            |mode| Config::save_preference(Preference::TabLayout(mode)),
+            cx,
+        );
+    }
+
+    /// `save` persists the choice; tests pass one that leaves the real
+    /// config alone.
+    pub(crate) fn set_tab_layout_with(
+        &mut self,
+        mode: TabLayoutMode,
+        save: impl FnOnce(TabLayoutMode) -> crate::Result<()> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.tab_layout == mode {
+            return;
+        }
+        self.config.tab_layout = mode;
+        if cx.has_global::<InitialAppearance>() {
+            cx.global_mut::<InitialAppearance>().config.tab_layout = mode;
+        }
+        crate::menus::install(cx);
+        cx.notify();
+        let saves = cx.default_global::<LayoutSaves>().tabs.clone();
+        saves.want(mode);
+        let save = cx
+            .background_executor()
+            .spawn(async move { saves.write_latest(save) });
+        cx.spawn(async move |_, _| {
+            if let Err(error) = save.await {
+                tracing::warn!(%error, "Could not save the tab layout");
+            }
+        })
+        .detach();
+    }
+
+    /// Switches how chat views draw, then keeps it as [`Self::set_layout`]
+    /// keeps the sidebar's.
+    pub(crate) fn set_chat_layout(&mut self, mode: ChatLayoutMode, cx: &mut Context<Self>) {
+        self.set_chat_layout_with(
+            mode,
+            |mode| Config::save_preference(Preference::ChatLayout(mode)),
+            cx,
+        );
+    }
+
+    /// `save` persists the choice; tests pass one that leaves the real
+    /// config alone.
+    pub(crate) fn set_chat_layout_with(
+        &mut self,
+        mode: ChatLayoutMode,
+        save: impl FnOnce(ChatLayoutMode) -> crate::Result<()> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.chat.layout == mode {
+            return;
+        }
+        self.config.chat.layout = mode;
+        if cx.has_global::<InitialAppearance>() {
+            cx.global_mut::<InitialAppearance>().config.chat.layout = mode;
+        }
+        self.chats.relayout(mode);
+        cx.notify();
+        let saves = cx.default_global::<LayoutSaves>().chat.clone();
+        saves.want(mode);
+        let save = cx
+            .background_executor()
+            .spawn(async move { saves.write_latest(save) });
+        cx.spawn(async move |_, _| {
+            if let Err(error) = save.await {
+                tracing::warn!(%error, "Could not save the chat layout");
+            }
+        })
+        .detach();
+    }
+
+    #[track_caller]
     pub(crate) fn navigate(
         &mut self,
         target: NavigationTarget<&str>,
@@ -65,7 +153,15 @@ impl HerdrWindow {
     /// Back or Forward along the selected endpoint's focus trail. The trail
     /// remembers the step only once its request is queued, so a press while
     /// an earlier one is still landing leaves that one in charge.
-    pub(crate) fn travel(&mut self, step: Step, cx: &mut Context<Self>) {
+    pub(crate) fn travel(&mut self, step: Step, window: &mut Window, cx: &mut Context<Self>) {
+        // A pane a section opened goes back to that section first.
+        if step == Step::Back
+            && self.activity_section().is_none()
+            && let Some(panel) = self.activity.return_to
+        {
+            self.show_activity_panel(panel, window, cx);
+            return;
+        }
         let Some(snapshot) = self.live.snapshot.clone() else {
             return;
         };
@@ -82,6 +178,12 @@ impl HerdrWindow {
     }
 
     pub(crate) fn can_travel(&self, step: Step) -> bool {
+        if step == Step::Back
+            && self.activity_section().is_none()
+            && self.activity.return_to.is_some()
+        {
+            return true;
+        }
         self.live.snapshot.as_deref().is_some_and(|snapshot| {
             self.endpoints[self.selected_endpoint]
                 .history
@@ -90,6 +192,7 @@ impl HerdrWindow {
     }
 
     /// Complete an accepted navigation even if its context menu has since opened.
+    #[track_caller]
     pub(crate) fn dispatch_navigation(
         &mut self,
         target: NavigationTarget<&str>,
@@ -113,6 +216,7 @@ impl HerdrWindow {
 
     /// `label` is what a failure is reported as, not a method name: navigation
     /// picks its method from the target, so it reports itself by name.
+    #[track_caller]
     pub(crate) fn request_focus_change(
         &mut self,
         label: &str,
@@ -129,6 +233,9 @@ impl HerdrWindow {
             if let Err(error) = enqueue(handle, &snapshot.boot_id) {
                 self.local_error = Some(format!("{label}: {error}"));
             } else {
+                #[cfg(feature = "integration-test")]
+                self.navigations
+                    .record(label, focus.as_ref(), std::panic::Location::caller());
                 self.fence_focus_change(focus);
                 return true;
             }
@@ -166,7 +273,7 @@ impl HerdrWindow {
                 focus,
                 active: true,
             });
-            state.surface = None;
+            state.invalidate_surface();
             state.dirty = true;
             self.live = state.clone();
             self.activation_deadline = Some(
@@ -195,6 +302,11 @@ impl HerdrWindow {
             return;
         }
         self.config.terminal.size = size;
+        // Font changes can alter wrapped row heights without changing the
+        // reading column's width. Keep the reader's scroll position.
+        for pane in self.chats.panes() {
+            pane.list.remeasure();
+        }
         // The console follows the rendered terminal face, as a reload makes it.
         log_window::set_appearance(&self.config, &self.theme, cx);
         cx.notify();
@@ -264,8 +376,44 @@ impl HerdrWindow {
                 self.open_browser_tab(None, window, cx);
                 return;
             }
+            Command::NextTab | Command::PreviousTab | Command::TabNumber(_)
+                if self.step_tab(command, window, cx) =>
+            {
+                return;
+            }
+            Command::ReopenClosedTab => {
+                self.reopen_closed_tab(window, cx);
+                return;
+            }
             Command::OpenOrchestrator => {
                 self.open_orchestrator(window, cx);
+                return;
+            }
+            Command::ReviewChanges => {
+                self.open_review(window, cx);
+                return;
+            }
+            Command::GitMenu => {
+                // Where the titlebar's Git button last painted, so the
+                // shortcut opens the menu where clicking the button does.
+                // Zen mode hides the button and leaves that point stale, so
+                // the menu drops from the top-right corner it sits near.
+                let anchor = if self.zen_active() {
+                    gpui::point(window.viewport_size().width - gpui::px(24.), gpui::px(24.))
+                } else {
+                    self.git_anchor.get()
+                };
+                self.open_git_menu(anchor, window, cx);
+                return;
+            }
+            Command::ToggleAnnotate => {
+                #[cfg(any(target_os = "macos", windows))]
+                self.toggle_shown_annotating(window, cx);
+                #[cfg(not(any(target_os = "macos", windows)))]
+                self.show_flash(
+                    Flash::warning("Annotating pages needs macOS or Windows"),
+                    cx,
+                );
                 return;
             }
             Command::SplitEditor => {
@@ -274,6 +422,14 @@ impl HerdrWindow {
             }
             Command::OpenCode => {
                 self.open_code(None, window, cx);
+                return;
+            }
+            Command::OpenPx0 => {
+                self.open_px0(None, window, cx);
+                return;
+            }
+            Command::RemotePair => {
+                self.open_remote_pairing(window, cx);
                 return;
             }
             Command::InstallBrowserSkill => {
@@ -292,6 +448,10 @@ impl HerdrWindow {
                 );
                 return;
             }
+            Command::ResumePalette => {
+                self.resume_palette(window, cx);
+                return;
+            }
             Command::GoToSymbol | Command::GoToFile => {
                 let mode = if command == Command::GoToFile {
                     crate::code_search::Mode::Files
@@ -303,6 +463,15 @@ impl HerdrWindow {
             }
             Command::NewWorktree => {
                 self.open_new_worktree(window, cx);
+                return;
+            }
+            Command::OpenWorktree | Command::RemoveWorktree => {
+                let shortcut = if command == Command::OpenWorktree {
+                    WorktreeShortcut::Open
+                } else {
+                    WorktreeShortcut::Remove
+                };
+                self.open_worktree_shortcut(shortcut, window, cx);
                 return;
             }
             Command::WorktreeNotes => {
@@ -367,7 +536,7 @@ impl HerdrWindow {
                 }
                 return;
             }
-            Command::ToggleFullScreen | Command::CycleWindows => {
+            Command::ToggleFullScreen | Command::CycleWindows | Command::CloseWindow => {
                 run_window_command(command, window, cx);
                 return;
             }
@@ -387,6 +556,8 @@ impl HerdrWindow {
                 return;
             }
             Command::ToggleSidebar => self.toggle_sidebar(),
+            Command::FocusNextRegion => return self.cycle_region(true, window, cx),
+            Command::FocusPreviousRegion => return self.cycle_region(false, window, cx),
             // Window chrome only, so it runs while the daemon is still away.
             Command::ToggleStatusBar => {
                 self.status_bar_visible = !self.status_bar_visible;
@@ -394,8 +565,19 @@ impl HerdrWindow {
                 cx.notify();
                 return;
             }
+            Command::ToggleZenMode => {
+                self.toggle_zen(window, cx);
+                return;
+            }
             Command::DevicesOverview => {
                 self.open_devices_overview(window, cx);
+                return;
+            }
+            // A focused page zooms instead of the terminal font, and keeps
+            // the keyboard if it held it.
+            Command::IncreaseFontSize | Command::DecreaseFontSize | Command::ResetFontSize
+                if self.zoom_focused_page(command, cx) =>
+            {
                 return;
             }
             Command::IncreaseFontSize | Command::DecreaseFontSize => {
@@ -405,9 +587,11 @@ impl HerdrWindow {
                     -FONT_SIZE_STEP
                 };
                 self.set_terminal_font_size(self.config.terminal.size + step, cx);
+                return;
             }
             Command::ResetFontSize => {
                 self.set_terminal_font_size(self.configured_terminal_size, cx);
+                return;
             }
             Command::ClearPane if !self.live.supports_pane_clear => {
                 // Older daemons do not advertise `pane.clear`. Say so rather than
@@ -432,6 +616,10 @@ impl HerdrWindow {
             }
             Command::RenamePane => {
                 self.rename_focused_pane(window, cx);
+                return;
+            }
+            Command::MovePane => {
+                self.move_focused_pane(window, cx);
                 return;
             }
             Command::RenameWorkspace | Command::CloseWorkspace => {
@@ -475,8 +663,10 @@ impl HerdrWindow {
                     Command::Back => Step::Back,
                     _ => Step::Forward,
                 };
-                self.travel(step, cx);
-                window.focus(&self.focus, cx);
+                self.travel(step, window, cx);
+                if self.activity_section().is_none() {
+                    window.focus(&self.focus, cx);
+                }
                 return;
             }
             Command::PreviousWorkspace
@@ -487,6 +677,10 @@ impl HerdrWindow {
             | Command::AgentNumber(_) => {
                 self.step_sidebar(command, cx);
                 window.focus(&self.focus, cx);
+                return;
+            }
+            // A browser tab moves without the daemon, so before its check.
+            Command::MoveTabPrevious | Command::MoveTabNext if self.move_page_tab(command, cx) => {
                 return;
             }
             Command::MoveTabPrevious | Command::MoveTabNext if !self.live.supports_tab_move => {
@@ -557,7 +751,7 @@ impl HerdrWindow {
 
     /// Installs the agent skill for browser tabs where Claude Code and other
     /// agents look for skills, and keeps it current from now on. Only on
-    /// request: the one-time offer, the palette, or Preferences.
+    /// request: the one-time offer, the palette, or Settings.
     pub(crate) fn install_browser_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::agent_skill::{AgentSkill, Choice};
         let home = match crate::config::home() {
@@ -572,7 +766,7 @@ impl HerdrWindow {
             self.dismiss_menu(window, cx);
         }
         let install = cx.background_executor().spawn(async move {
-            let text = crate::agent_skill::text(std::env::current_exe().ok().as_deref());
+            let text = crate::agent_skill::text(crate::agent_skill::executable().as_deref());
             crate::agent_skill::install(&home, &text)
         });
         cx.spawn(async move |this, cx| {
@@ -586,32 +780,6 @@ impl HerdrWindow {
                     Err(error) => Flash::warning(error.to_string()),
                 };
                 this.show_flash(flash, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Removes the skill files the app wrote and stops keeping them current.
-    pub(crate) fn remove_browser_skill(&mut self, cx: &mut Context<Self>) {
-        use crate::agent_skill::{AgentSkill, Choice};
-        let Ok(home) = crate::config::home() else {
-            return;
-        };
-        AgentSkill::choose(Choice::Declined, cx);
-        let remove = cx
-            .background_executor()
-            .spawn(async move { crate::agent_skill::remove(&home) });
-        cx.spawn(async move |this, cx| {
-            let result = remove.await;
-            this.update(cx, |this, cx| {
-                let flash = match result {
-                    Ok(paths) if paths.is_empty() => Flash::success("No browser skill to remove"),
-                    Ok(_) => Flash::success("Removed the browser skill"),
-                    Err(error) => Flash::warning(error.to_string()),
-                };
-                this.show_flash(flash, cx);
-                cx.notify();
             })
             .ok();
         })
@@ -649,10 +817,10 @@ impl HerdrWindow {
             .debug_selector(|| "agent-skill-offer".into())
             .child(div().p(px(8.)).child("Let agents show you pages?"))
             .child(div().p(px(8.)).child(
-                "Agents in your panes can open pages and HTML drafts in browser tabs here, and read the notes you pin on them. A skill teaches them how.",
+                "Agents in your panes can open pages and HTML drafts in browser tabs here, read the notes you pin on them, and write automations for you to approve. Skills teach them how.",
             ))
             .child(div().p(px(8.)).text_color(rgb(theme.muted)).child(
-                "Install writes herdr-gpui-browser/SKILL.md into ~/.claude/skills and ~/.agents/skills, whichever exist, and keeps it up to date. A skill of that name you wrote yourself is left alone. Remove it any time in Preferences.",
+                "Install writes herdr-gpui-browser/SKILL.md and herdr-automations/SKILL.md into ~/.claude/skills and ~/.agents/skills, whichever exist, and keeps them up to date. A skill of either name you wrote yourself is left alone. Remove them any time in Settings.",
             ))
             .child(
                 div()
@@ -687,6 +855,7 @@ pub(crate) fn run_window_command(
     match command {
         Command::ToggleFullScreen => window.toggle_fullscreen(),
         Command::CycleWindows => cycle_windows(window, cx),
+        Command::CloseWindow => window.remove_window(),
         _ => return false,
     }
     true

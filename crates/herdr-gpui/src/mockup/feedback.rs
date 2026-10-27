@@ -1,5 +1,5 @@
 //! What "Send to agent" hands back: the user's picks and notes as Markdown.
-//! They go to the agent's pane through the running Herdr GPUI, as page notes
+//! They go to the agent's pane through the running Herdr UI, as page notes
 //! do, or else to a file written whole so a waiting agent never reads half.
 use crate::control::NotesTo;
 use std::{
@@ -81,16 +81,16 @@ pub(super) type SendNotes = fn(String) -> crate::Result<NotesTo>;
 pub(super) enum Sent {
     /// To the agent, through the window showing its pane.
     Agent,
-    /// Held by Herdr GPUI for `browser feedback` rather than queued to an agent.
+    /// Held by Herdr UI for `browser feedback` rather than queued to an agent.
     Kept,
     /// The request may have reached the app; a file fallback could duplicate it.
     Unconfirmed { source: crate::Error },
-    /// Herdr GPUI could not take them, so they went to the file.
+    /// Herdr UI could not take them, so they went to the file.
     File {
         path: PathBuf,
         unreached: crate::Error,
     },
-    /// Neither Herdr GPUI nor a file: only the terminal has them.
+    /// Neither Herdr UI nor a file: only the terminal has them.
     Printed { unreached: crate::Error },
 }
 
@@ -125,10 +125,11 @@ pub(super) fn deliver(
         Err(error) => error,
     };
     let rejected = match &unreached {
-        crate::Error::ControlUnavailable { .. }
-        | crate::Error::ControlUnsupported
+        crate::Error::Control(crate::control::Error::Unavailable { .. })
         | crate::Error::MissingStateRoot => true,
-        crate::Error::ControlRejected { code, .. } => *code != crate::control::ErrorCode::Timeout,
+        crate::Error::Control(crate::control::Error::Rejected { code, .. }) => {
+            *code != crate::control::ErrorCode::Timeout
+        }
         _ => false,
     };
     if !rejected {
@@ -232,7 +233,7 @@ mod tests {
     }
 
     fn unreachable(_: String) -> crate::Result<NotesTo> {
-        Err(crate::Error::ControlUnsupported)
+        Err(crate::Error::MissingStateRoot)
     }
 
     #[test]
@@ -271,7 +272,7 @@ mod tests {
             panic!("expected the file, got {sent:?}");
         };
         assert_eq!(written, &path);
-        assert!(matches!(unreached, crate::Error::ControlUnsupported));
+        assert!(matches!(unreached, crate::Error::MissingStateRoot));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "Picked: B\n");
         assert!(sent.status().starts_with("Saved to "), "{}", sent.status());
         let printed = deliver("x".into(), None, unreachable).unwrap();

@@ -1,5 +1,7 @@
 use super::*;
 
+mod shell;
+
 fn utf16(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
@@ -58,23 +60,25 @@ fn invalid_distros_and_sessions_are_rejected_before_anything_spawns() {
     let stop = AtomicBool::new(false);
     assert!(matches!(
         connect("-oops", "default", &stop),
-        Err(Error::InvalidWslDistro)
+        Err(crate::Error::Wsl(Error::InvalidDistro))
     ));
     assert!(matches!(
         connect("Ubuntu", "../escape", &stop),
-        Err(Error::InvalidSession)
+        Err(crate::Error::InvalidSession)
     ));
     assert!(matches!(
         probe_distro("bad name", "default"),
-        Err(Error::InvalidWslDistro)
+        Err(crate::Error::Wsl(Error::InvalidDistro))
     ));
     assert!(matches!(
         list_distro_sessions("bad/name"),
-        Err(Error::InvalidWslDistro)
+        Err(crate::Error::Wsl(Error::InvalidDistro))
     ));
     assert!(matches!(
         delete_distro_session("Ubuntu", "default"),
-        Err(Error::DefaultSession)
+        Err(crate::Error::Sessions(
+            crate::sessions::Error::DeleteDefault
+        ))
     ));
 }
 
@@ -84,23 +88,26 @@ fn other_platforms_refuse_wsl_plainly() {
     let stop = AtomicBool::new(false);
     assert!(matches!(
         connect("Ubuntu", "default", &stop),
-        Err(Error::WslUnsupported)
+        Err(crate::Error::Wsl(Error::Unsupported))
     ));
-    assert!(matches!(list_distros(), Err(Error::WslUnsupported)));
+    assert!(matches!(
+        list_distros(),
+        Err(crate::Error::Wsl(Error::Unsupported))
+    ));
     assert!(matches!(
         probe_distro("Ubuntu", "default"),
-        Err(Error::WslUnsupported)
+        Err(crate::Error::Wsl(Error::Unsupported))
     ));
     assert!(matches!(
         list_distro_sessions("Ubuntu"),
-        Err(Error::WslUnsupported)
+        Err(crate::Error::Wsl(Error::Unsupported))
     ));
     assert!(matches!(
         delete_distro_session("Ubuntu", "work"),
-        Err(Error::WslUnsupported)
+        Err(crate::Error::Wsl(Error::Unsupported))
     ));
     assert_eq!(
-        Error::WslUnsupported.kind(),
+        crate::Error::Wsl(Error::Unsupported).kind(),
         std::io::ErrorKind::Unsupported
     );
 }

@@ -9,40 +9,19 @@ use crate::{
         groups::{GroupId, Pick, Slot},
     },
     listening_ports::Link,
+    tab_layout::{Mark, Probe, TabContext, TabFace},
     window::Flash,
 };
 use gpui::{prelude::*, *};
 
+/// What a page's tab shows until the page reports an icon of its own.
+const GLOBE: &str = "icons/globe.svg";
+
 impl HerdrWindow {
-    /// A page, filling the space it is given. It also records where the
-    /// page draws, so a menu hides only the pages it covers; and, while one
-    /// does, it shows the page's picture in its place.
-    pub(in crate::browser) fn page_area(&self, id: TabId, page: impl IntoElement) -> Div {
-        let area = div().flex_1().min_h_0().relative().child(page);
-        #[cfg(any(target_os = "macos", windows))]
-        let area = {
-            let (picture, bounds) = (self.frozen_picture(id), self.browser.page_bounds.clone());
-            area.child(
-                canvas(
-                    move |area, _, _| {
-                        bounds.borrow_mut().insert(id, area);
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0(),
-            )
-            .children(picture.map(|picture| {
-                img(picture)
-                    .debug_selector(|| "page-picture".into())
-                    .absolute()
-                    .inset_0()
-                    .size_full()
-            }))
-        };
-        #[cfg(not(any(target_os = "macos", windows)))]
-        let _ = id;
-        area
+    /// A page, filling the space it is given. The page records where it
+    /// draws as it lays out.
+    pub(in crate::browser) fn page_area(&self, page: impl IntoElement) -> Div {
+        div().flex_1().min_h_0().child(page)
     }
 
     /// The workspace's browser tabs, after its Herdr tabs in a group's strip.
@@ -50,6 +29,7 @@ impl HerdrWindow {
         &self,
         slot: Slot,
         shown: Option<TabId>,
+        faces: &TabContext<'_>,
         cx: &mut Context<Self>,
     ) -> Vec<(TabId, Stateful<Div>)> {
         let (Some((scope, workspace)), Some(store)) = (self.browser_key(), store(cx)) else {
@@ -60,71 +40,46 @@ impl HerdrWindow {
             .filter(|tab| self.group_lists(slot.id, &Pick::Page(tab.id)))
             .cloned()
             .collect();
+        let layout = self.tab_layout();
         tabs.into_iter()
             .map(|tab| {
                 let id = tab.id;
-                let (background, text) = self.tab_colors(shown == Some(id), slot.id);
                 // The VS Code tab bears its mark; a review tab shows a diff,
                 // a code tab a file, and the overview devices, not a page.
-                let icon = match tab.location {
-                    _ if tab.place.is_code() => "icons/vscode.svg",
-                    Some(Location::Review { .. }) => "icons/diff-unified.svg",
-                    Some(Location::Code { .. }) => "icons/code.svg",
-                    Some(Location::Orchestrator { .. }) => "icons/pulse.svg",
-                    Some(Location::Devices) => "icons/devices.svg",
-                    _ => "icons/globe.svg",
+                let icon = match (tab.place.editor(), &tab.location) {
+                    (Some(editor), _) => editor.icon(),
+                    (_, Some(Location::Review { .. })) => "icons/diff-unified.svg",
+                    (_, Some(Location::Code { .. })) => "icons/code.svg",
+                    (_, Some(Location::Orchestrator { .. })) => "icons/pulse.svg",
+                    (_, Some(Location::Devices)) => "icons/devices.svg",
+                    _ => GLOBE,
                 };
-                let tab = div()
+                // A page's own icon stands in for the globe.
+                let mark = match self.tab_favicon(id).filter(|_| icon == GLOBE) {
+                    Some(favicon) => Mark::Favicon(favicon),
+                    None => Mark::Icon(icon),
+                };
+                let base = div()
                     .id(SharedString::from(format!("browser-tab-{id}")))
-                    .debug_selector(move || slot.selector(&format!("browser-tab-{id}")))
-                    .pl(px(10.))
-                    .pr(px(3.))
-                    .py(px(2.))
-                    .min_w(px(crate::TAB_WIDTH))
+                    .debug_selector(move || slot.selector(&format!("browser-tab-{id}")));
+                let face = TabFace {
+                    label: tab_label(&tab.title),
+                    mark,
+                    zoomed: false,
+                    probe: Probe::Page(id),
+                    // Split, the page closes in its group alone.
+                    close: Box::new(cx.listener(move |this, _, window, cx| {
+                        this.close_strip_tab(Pick::Page(id), window, cx);
+                    })),
+                };
+                let tab = layout
+                    .tab(
+                        base,
+                        face,
+                        self.tab_state(shown == Some(id), slot.id),
+                        faces,
+                    )
                     .map(|tab| self.grow_tab(tab, slot.id, &Pick::Page(id)))
-                    .border_r_1()
-                    .border_color(rgb(self.theme.active))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .cursor_pointer()
-                    .bg(rgb(background))
-                    .text_color(rgb(text))
-                    .child(
-                        svg()
-                            .path(icon)
-                            .size(px(12.))
-                            .flex_none()
-                            .text_color(rgb(text)),
-                    )
-                    .child(tab_label(&tab.title))
-                    .child(
-                        div()
-                            .id("close-browser-tab")
-                            .debug_selector(move || {
-                                slot.selector(&format!("close-browser-tab-{id}"))
-                            })
-                            .size(px(18.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(crate::config::corners::CONTROL))
-                            .hover(move |s| s.bg(rgba((text << 8) | 0x24)))
-                            .child(
-                                svg()
-                                    .path("icons/close.svg")
-                                    .size(px(12.))
-                                    .text_color(rgb(text)),
-                            )
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            // Split, the page closes in its group alone.
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_strip_tab(slot.id, Pick::Page(id), window, cx);
-                            })),
-                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.show_browser_tab_in(Some(slot.id), id, window, cx);
                     }));
@@ -172,12 +127,11 @@ impl HerdrWindow {
         &mut self,
         slot: Slot,
         tab: &Tab,
-        gap: f32,
         keyboard: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = tab.id;
-        let code = tab.place.is_code();
+        let code = tab.place.is_editor();
         let loaded = tab.location.is_some();
         let external = match &tab.location {
             Some(Location::Web { url }) => Some(url.clone()),
@@ -191,7 +145,7 @@ impl HerdrWindow {
             let shown = self
                 .browser
                 .annotations
-                .panel_shown(id, std::time::Instant::now());
+                .panel_shown(id, crate::motion::now());
             let panel = (shown > 0.).then(|| {
                 div()
                     .flex_none()
@@ -248,7 +202,7 @@ impl HerdrWindow {
         #[cfg(not(any(target_os = "macos", windows)))]
         let (annotate_button, panel): (Option<Stateful<Div>>, Option<AnyElement>) = (None, None);
         #[cfg(any(target_os = "macos", windows))]
-        let page = self.browser.pages.page(id).cloned();
+        let page = self.browser.pages.element(id);
         #[cfg(not(any(target_os = "macos", windows)))]
         let page: Option<AnyView> = None;
         let failure = self.browser.failed.get(&id).cloned();
@@ -261,6 +215,7 @@ impl HerdrWindow {
             (None, true) => "Loading\u{2026}".into(),
         };
         let toolbar = div()
+            .debug_selector(move || slot.selector("browser-toolbar"))
             .flex()
             .flex_none()
             .items_center()
@@ -276,11 +231,11 @@ impl HerdrWindow {
                 "icons/arrow-left.svg",
                 loaded,
                 cx,
-                move |this, _, cx| {
+                move |this, _, _| {
                     #[cfg(any(target_os = "macos", windows))]
-                    this.browser.pages.back(id, cx);
+                    this.browser.pages.back(id);
                     #[cfg(not(any(target_os = "macos", windows)))]
-                    let _ = (this, cx);
+                    let _ = this;
                 },
             ))
             .child(self.toolbar_button(
@@ -289,11 +244,11 @@ impl HerdrWindow {
                 "icons/arrow-right.svg",
                 loaded,
                 cx,
-                move |this, _, cx| {
+                move |this, _, _| {
                     #[cfg(any(target_os = "macos", windows))]
-                    this.browser.pages.forward(id, cx);
+                    this.browser.pages.forward(id);
                     #[cfg(not(any(target_os = "macos", windows)))]
-                    let _ = (this, cx);
+                    let _ = this;
                 },
             ))
             .child(self.toolbar_button(
@@ -302,11 +257,11 @@ impl HerdrWindow {
                 "icons/refresh.svg",
                 loaded,
                 cx,
-                move |this, _, cx| {
+                move |this, _, _| {
                     #[cfg(any(target_os = "macos", windows))]
-                    this.browser.pages.reload(id, cx);
+                    this.browser.pages.reload(id);
                     #[cfg(not(any(target_os = "macos", windows)))]
-                    let _ = (this, cx);
+                    let _ = this;
                 },
             ))
             .child(
@@ -331,18 +286,19 @@ impl HerdrWindow {
             )
             // A split shows the window's flash once, in the group in use.
             .children(
-                self.flash
-                    .as_ref()
+                self.flash_shown()
                     .filter(|_| Some(slot.id) == self.active_group())
-                    .map(|(flash, _)| {
+                    .map(|(flash, shown)| {
                         div()
                             .flex_none()
+                            .opacity(shown)
                             .max_w(px(240.))
                             .truncate()
                             .text_color(rgb(flash.accent(&self.theme)))
                             .child(flash.text.clone())
                     }),
             )
+            .children(self.zoom_chip(slot, tab, cx))
             .children(annotate_button)
             .child(self.toolbar_button(
                 slot,
@@ -356,10 +312,9 @@ impl HerdrWindow {
                     }
                 },
             ));
-        let content = match (page, &failure) {
-            (Some(page), None) => self.page_area(id, page).into_any_element(),
-            // The VS Code tab says why its page is not there yet.
-            _ if tab.place.is_code() => self.render_code_status(failure.clone(), cx),
+        let content = match (page, &failure, tab.place.editor()) {
+            (Some(page), None, _) => self.page_area(page).into_any_element(),
+            (_, _, Some(editor)) => self.render_editor_status(editor, failure.clone(), cx),
             _ => div()
                 .flex_1()
                 .min_h_0()
@@ -382,7 +337,7 @@ impl HerdrWindow {
                 )
                 .into_any_element(),
         };
-        div()
+        let browser = div()
             .id(SharedString::from(slot.selector("browser")))
             .debug_selector(move || slot.selector("browser"))
             .flex()
@@ -390,8 +345,6 @@ impl HerdrWindow {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .pl(px(gap))
-            .bg(rgb(self.theme.background))
             // Keeps window shortcuts reachable while the page does not hold
             // the keyboard; nothing here types into a terminal. A focus
             // handle belongs to one element, so a drawn terminal keeps it.
@@ -406,8 +359,8 @@ impl HerdrWindow {
                     .min_h_0()
                     .child(div().flex().flex_col().flex_1().min_w_0().child(content))
                     .children(panel.filter(|_| !code)),
-            )
-            .into_any_element()
+            );
+        self.with_ground(browser, rgb(self.theme.background))
     }
 
     /// The workspace's listening ports under a blank tab's prompt, each
@@ -508,9 +461,10 @@ impl HerdrWindow {
     ) {
         Store::update(cx, |store| store.visited(id, Some(location.clone()), None));
         #[cfg(any(target_os = "macos", windows))]
-        if self.browser.pages.contains(id) {
-            self.browser.pages.load(id, &location, cx);
-            self.browser.pages.focus(id, cx);
+        {
+            // A page still being built goes there once built.
+            self.browser.pages.load(id, &location);
+            self.browser.pages.focus(id);
         }
         self.show_browser_tab_in(Some(group), id, window, cx);
     }

@@ -120,7 +120,7 @@ fn font_size_batches_validate_every_change_before_writing() -> anyhow::Result<()
     fs::write(&path, original)?;
     assert!(matches!(
         Config::save_font_sizes_path(&[(FontFace::Sidebar, 14.), (FontFace::Ui, 49.)], &path),
-        Err(Error::InvalidFontSize("ui"))
+        Err(crate::Error::Settings(Error::InvalidFontSize("ui")))
     ));
     assert_eq!(fs::read_to_string(&path)?, original);
     Config::save_font_sizes_path(&[(FontFace::Sidebar, 14.), (FontFace::Ui, 20.)], &path)?;
@@ -167,7 +167,7 @@ fn detection_ranks_symbol_and_mono_faces_and_ignores_text_families() {
 #[test]
 fn detection_fills_only_the_faces_the_config_left_alone() -> anyhow::Result<()> {
     let mut config = Config::parse("[terminal]\nfallback = ['Menlo']\n[ui]\nfallback = []")?;
-    config.resolve_fonts(installed);
+    config.resolve_fonts_with(installed, |_| false);
     assert_eq!(
         config.terminal.fallbacks.as_deref(),
         Some(["Menlo".to_owned()].as_slice())
@@ -195,10 +195,13 @@ fn fonts_are_not_enumerated_when_nothing_needs_checking() -> anyhow::Result<()> 
              [terminal]\nfallback = []\n[ui]\nfallback = []",
     )?;
     let mut enumerated = false;
-    config.resolve_fonts(|| {
-        enumerated = true;
-        Vec::<String>::new()
-    });
+    config.resolve_fonts_with(
+        || {
+            enumerated = true;
+            Vec::<String>::new()
+        },
+        |_| false,
+    );
     let defaults = crate::config::fonts::PLATFORM_FONTS;
     assert_eq!(enumerated, defaults.is_replaceable(defaults.monospace));
     Ok(())
@@ -226,7 +229,7 @@ fn configured_fallbacks_reach_the_shaping_font_in_order() -> anyhow::Result<()> 
 fn fallback_lists_are_validated_per_face() {
     assert!(matches!(
         Config::parse("[terminal]\nfallback = ['Menlo', '  ']"),
-        Err(Error::EmptyFontFallback("terminal"))
+        Err(crate::Error::Settings(Error::EmptyFontFallback("terminal")))
     ));
     let list = |count: usize| {
         (0..count)
@@ -239,7 +242,9 @@ fn fallback_lists_are_validated_per_face() {
             "[sidebar]\nfallback = [{}]",
             list(MAX_FONT_FALLBACKS + 1)
         )),
-        Err(Error::TooManyFontFallbacks("sidebar"))
+        Err(crate::Error::Settings(Error::TooManyFontFallbacks(
+            "sidebar"
+        )))
     ));
     assert!(
         Config::parse(&format!(

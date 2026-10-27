@@ -19,13 +19,17 @@ use super::{
 };
 use crate::{
     Command, HerdrWindow, NavigationTarget,
-    config::{FontConfig, Theme},
+    avatars::Checkout,
+    config::{AgentsPlacement, FontConfig, Theme},
     fonts::StyledFont,
 };
 use gpui::{prelude::*, *};
 
 mod agent_rows;
 mod device_tree;
+mod nested_agents;
+
+pub(crate) use nested_agents::NestedReveal;
 
 impl HerdrWindow {
     pub(crate) fn render_sidebar(
@@ -36,7 +40,7 @@ impl HerdrWindow {
     ) -> Stateful<Div> {
         let width = sidebar_width(self.sidebar_width, f32::from(window.viewport_size().width));
         let split = self.sidebar_split.unwrap_or(0.5).clamp(0.1, 0.9);
-        let look = layout::for_config(&self.config);
+        let look = layout::for_config(&self.config, self.fill());
         let rows = layout_for(self.config.layout.mode);
         // The row a workspace menu was opened for keeps looking hovered while
         // the pointer is over the menu.
@@ -48,8 +52,9 @@ impl HerdrWindow {
         let spaces_custom = self.config.usage.inline
             && self.config.sidebar_layout.spaces != crate::config::SpaceLayout::default();
         let theme = &self.theme;
+        // The field is the heading, so it takes the heading's face.
         self.sidebar_search.input.update(cx, |input, cx| {
-            input.set_appearance(self.config.ui.clone(), theme.clone(), cx);
+            input.set_appearance(font.clone(), theme.clone(), cx);
         });
         // The Devices layout heads every device, even a lone one, and lists
         // its agents under it in place of its workspaces. Its own field
@@ -59,11 +64,14 @@ impl HerdrWindow {
         // A hidden field keeps whatever it held, but never filters the list.
         let searchable = self.config.show_sidebar_search && !devices;
         let tree_search = self.config.show_sidebar_search && devices;
-        let search = (searchable && self.sidebar_search.query().is_some())
-            .then(|| self.sidebar_search_results(self.sidebar_search_hits(), indicators, look, cx));
+        let search = (searchable && self.sidebar_search.query().is_some()).then(|| {
+            self.sidebar_search_results(self.sidebar_search_hits(cx), indicators, look, cx)
+        });
         let mut spaces = div()
             .id("spaces-scroll")
             .debug_selector(|| "spaces-scroll".into())
+            .role(Role::List)
+            .aria_label(if devices { "Devices" } else { "Workspaces" })
             .flex()
             .flex_col()
             .flex_1()
@@ -72,22 +80,32 @@ impl HerdrWindow {
         let mut agents = div()
             .id("agents-scroll")
             .debug_selector(|| "agents-scroll".into())
+            .role(Role::List)
+            .aria_label("Agents")
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll();
+        self.sidebar_scroll.iter().for_each(sticky::settle);
         spaces = spaces.track_scroll(&self.sidebar_scroll[0]);
         agents = agents.track_scroll(&self.sidebar_scroll[1]);
         let multi = self.endpoints.len() > 1;
         let headed = multi || devices;
-        let agents_panel = self.config.show_agents && !devices;
+        let placement = self
+            .config
+            .show_agents
+            .then_some(self.config.agents_placement);
+        let agents_panel = placement == Some(AgentsPlacement::Panel) && !devices;
+        let nested_agents = placement == Some(AgentsPlacement::Nested) && !devices;
         let query = if tree_search {
             self.device_tree_query(cx)
         } else {
             String::new()
         };
         let mut agent_count = 0;
+        // The focused agent's row when agents nest under their workspaces.
+        let mut nested_focus = None;
         // A plugin view hid every agent, rather than there being none.
         let mut filtered = false;
         // Child positions of the highlighted rows, for the one-time reveal below.
@@ -102,9 +120,12 @@ impl HerdrWindow {
         let mut drop_rows = Vec::new();
         let mut drop_requests = Vec::new();
         let mut drop_dragged = 0;
-        let now = std::time::Instant::now();
-        let mut sliding = false;
-        for (endpoint_index, endpoint) in self.endpoints.iter().enumerate() {
+        let now = crate::motion::now();
+        // A lifted device folds the list to its headers.
+        let device_plan = headed.then(|| self.device_plan(devices, &query)).flatten();
+        let mut sliding = device_plan.as_ref().is_some_and(|plan| plan.sliding);
+        let worktree_glyph = self.config.worktrees.glyph(theme);
+        for (endpoint_index, endpoint) in self.displayed_devices() {
             if !self.device_visible(&endpoint.id)
                 || (devices && !self.device_listed(endpoint_index, &query))
             {
@@ -120,8 +141,18 @@ impl HerdrWindow {
             );
             if headed {
                 host_rows.push((endpoint_index, space_rows));
-                spaces = spaces.child(self.host_row(endpoint, selected, look, width, false, cx));
+                let header = self.host_row(endpoint, selected, look, width, false, cx);
+                spaces = self.place_host_row(
+                    spaces,
+                    header,
+                    (endpoint_index, space_rows),
+                    device_plan.as_ref(),
+                    cx,
+                );
                 space_rows += 1;
+            }
+            if device_plan.is_some() {
+                continue;
             }
             if devices {
                 let (list, rows, focused) =
@@ -149,6 +180,7 @@ impl HerdrWindow {
             let Some(snapshot) = &live.snapshot else {
                 continue;
             };
+            let pr_view = self.endpoint_pr_view(endpoint_index);
             let collapsed_repos = if endpoint_index == 0 {
                 &self.collapsed_repos
             } else {
@@ -201,6 +233,7 @@ impl HerdrWindow {
                     break;
                 }
                 let workspace = &snapshot.workspaces[index];
+                let linked = crate::worktree_identity::is_linked(workspace);
                 if selected && workspace.focused {
                     highlighted[0] = Some(space_rows);
                 }
@@ -237,28 +270,16 @@ impl HerdrWindow {
                     (true, false) => RowTree::Child,
                     (true, true) => RowTree::LastChild,
                 };
+                let fold_toggle = group.clone().map(|key| (endpoint_id.clone(), key));
                 let fold = group.map(|key| Fold {
                     id: SharedString::from(format!("collapse-{endpoint_id}-{id}")).into(),
                     index,
                     collapsed: collapsed_repos.contains(&key),
                     toggle: Box::new(cx.listener(move |this, _, _, cx| {
-                        let collapsed = if collapse_endpoint == crate::endpoint::LOCAL {
-                            &mut this.collapsed_repos
-                        } else if let Some(endpoint) = this
-                            .endpoints
-                            .iter_mut()
-                            .find(|e| e.id == collapse_endpoint)
-                        {
-                            &mut endpoint.collapsed_repos
-                        } else {
-                            return;
-                        };
-                        if !collapsed.remove(&key) {
-                            collapsed.insert(key.clone());
-                        }
-                        cx.notify();
+                        this.toggle_repository(&collapse_endpoint, &key, cx);
                     })),
                 });
+                let folds = fold.as_ref().map(|fold| fold.collapsed).zip(fold_toggle);
                 let label = workspace_label(workspace, indented);
                 let shown_status = if self.config.usage.inline {
                     displayed_workspace_status(&snapshot.workspaces, workspace, collapsed_repos)
@@ -339,6 +360,9 @@ impl HerdrWindow {
                         },
                     ))
                 });
+                // A child's trunk runs on past its note and ports to the next
+                // sibling, as it runs through the row itself.
+                let trunk = rows.trunk_below(&format!("{endpoint_id}-{id}"), tree, &row_cx);
                 let ports = (self.config.show_listening_ports && !removing_row)
                     .then_some(daemon.as_ref())
                     .flatten()
@@ -356,6 +380,7 @@ impl HerdrWindow {
                             .child(crate::listening_ports::chips(
                                 listed,
                                 (&endpoint_id, &workspace.workspace_id),
+                                &self.tunnels,
                                 theme,
                                 (font.size * 0.85).round(),
                                 cx,
@@ -367,22 +392,34 @@ impl HerdrWindow {
                         workspace,
                         label,
                         tree,
-                        icon: if indented {
+                        // A child hangs from the main checkout on the guide
+                        // lines; one standing alone has no line to hang from,
+                        // so it takes the branch glyph where the owner's
+                        // avatar sat.
+                        icon: if let Some(glyph) = worktree_glyph.filter(|_| linked && !indented) {
+                            RowIcon::Worktree(glyph)
+                        } else if indented || !self.config.show_repository_icons {
                             RowIcon::None
+                        } else if workspace.branch.is_none() {
+                            // Not a Git checkout, so no mark that reads as one.
+                            RowIcon::Blank
                         } else {
+                            let target = &endpoint.connection.target;
                             self.avatars
                                 .as_ref()
-                                .filter(|_| endpoint_index == 0)
-                                .and_then(|avatars| avatars.image(&workspace.new_workspace_cwd))
+                                .zip(Checkout::of(endpoint_index == 0, target, workspace))
+                                .and_then(|(avatars, checkout)| avatars.image(checkout))
                                 .map_or(RowIcon::Mark, RowIcon::Avatar)
                         },
                         fold,
                         grouped,
                         badge: workspace_badge(
                             workspace,
-                            (endpoint_index == self.selected_endpoint)
-                                .then_some(&self.menu.pr_cache),
-                            &self.git,
+                            pr_view.as_ref().map(|view| (&self.menu.pr_cache, view)),
+                            (
+                                (endpoint_index == 0).then_some(&self.git),
+                                self.config.sidebar_style.change_counts,
+                            ),
                             (&self.teleport_marks, &endpoint.id),
                             note.as_deref(),
                             theme,
@@ -466,6 +503,15 @@ impl HerdrWindow {
                     },
                 )
                 .id(SharedString::from(format!("workspace-{endpoint_id}-{id}")))
+                .map(|row| {
+                    let name = super::accessibility::workspace_name(
+                        label,
+                        linked,
+                        shown_status,
+                        row_cx.host,
+                    );
+                    self.workspace_item(row, name, selected && workspace.focused, folds, cx)
+                })
                 .when(multi, |row| {
                     row.debug_selector(|| format!("workspace-{endpoint_id}-{id}"))
                 })
@@ -492,6 +538,9 @@ impl HerdrWindow {
                     row.on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            if this.config.features.sidebar_hover_menu {
+                                this.press_hovered_workspace(&press_id, event.position);
+                            }
                             if event.click_count == 1 {
                                 this.press_workspace(&press_id, event.position, cx);
                             }
@@ -499,9 +548,24 @@ impl HerdrWindow {
                     )
                 })
                 .when(carried, |row| row.cursor_grabbing());
-                // The note and ports ride under their row as one list item, so
-                // the drop preview still measures one height per workspace.
-                let element = if note_line.is_none() && ports.is_none() {
+                let indent = layout.child_indent() * if indented { 2. } else { 1. };
+                let agent_rows = if nested_agents {
+                    let (rows, focused) = self.nested_agent_rows(
+                        endpoint_index,
+                        snapshot,
+                        &workspace.workspace_id,
+                        (&row_cx, indent),
+                        cx,
+                    );
+                    nested_focus = nested_focus.or(focused);
+                    rows
+                } else {
+                    Vec::new()
+                };
+                // The note, ports and nested agents ride under their row as one
+                // list item, so the drop preview still measures one height per
+                // workspace.
+                let element = if note_line.is_none() && ports.is_none() && agent_rows.is_empty() {
                     element
                         .when(gap > 0., |row| row.mt(px(gap)))
                         .when(shift != px(0.), |row| row.top(shift))
@@ -516,8 +580,20 @@ impl HerdrWindow {
                         .when(gap > 0., |unit| unit.mt(px(gap)))
                         .when(shift != px(0.), |unit| unit.top(shift))
                         .child(element)
-                        .children(note_line)
-                        .children(ports)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .relative()
+                                .children(note_line)
+                                .children(ports)
+                                .children(agent_rows)
+                                // Last, so a selected nested agent's fill does
+                                // not hide it, as a row draws its guide over
+                                // its own fill.
+                                .children(trunk),
+                        )
                         .into_any_element()
                 };
                 spaces = if carried {
@@ -553,7 +629,17 @@ impl HerdrWindow {
         }
         // Rows under the pinned header are hidden, so a reveal must clear it.
         let cover = px(sticky::cover(&headers));
+        // Search results stand in for the spaces list, so no nested row paints.
+        self.reveal_nested_agent(nested_focus.filter(|_| search.is_none()), cover, window);
+        // Folded headers slide under a pinned one, so none is pinned then,
+        // nor in the frame that unfolds, whose header places are the folded
+        // list's; the frame after pins from the unfolded one.
+        let unfolding = self.sidebar_folded.replace(device_plan.is_some()) && device_plan.is_none();
+        if unfolding {
+            window.request_animation_frame();
+        }
         let pinned_host = sticky::pinned(&headers)
+            .filter(|_| device_plan.is_none() && !unfolding)
             .and_then(|pinned| self.pinned_host_row(pinned, look, width, cx));
         // Follow the selection, but only once a frame has measured the viewport:
         // the handle resolves the request against the previous frame's bounds, so
@@ -603,6 +689,8 @@ impl HerdrWindow {
         div()
             .id("sidebar")
             .debug_selector(|| "sidebar".into())
+            .role(Role::Navigation)
+            .aria_label("Sidebar")
             .relative()
             .w(px(width))
             .flex_none()
@@ -615,7 +703,7 @@ impl HerdrWindow {
             .text_size(px(font.size))
             .line_height(px(line_height(font)))
             .text_color(rgb(theme.foreground))
-            .bg(rgb(theme.sidebar_background()))
+            .bg(self.fill().panel(theme.sidebar_background()))
             .border_r_1()
             .border_color(rgb(theme.active))
             // Zero flex bases keep long workspace lists from displacing agents.
@@ -631,16 +719,21 @@ impl HerdrWindow {
                     })
                     .min_h_0()
                     .overflow_hidden()
-                    .child(header(
-                        if devices { "devices" } else { "spaces" },
-                        font,
-                        theme,
-                        look,
-                    ))
-                    .when(searchable, |section| {
-                        section.child(self.sidebar_search_field(look, cx))
-                    })
-                    .children(tree_search.then(|| self.device_tree_search(look)).flatten())
+                    // With search on, the heading is its field.
+                    .child(
+                        searchable
+                            .then_some(super::search::Heading::Spaces)
+                            .or(tree_search.then_some(super::search::Heading::DeviceTree))
+                            .and_then(|heading| self.search_heading(heading, look, window, cx))
+                            .unwrap_or_else(|| {
+                                header(
+                                    if devices { "devices" } else { "spaces" },
+                                    font,
+                                    theme,
+                                    look,
+                                )
+                            }),
+                    )
                     // The wrapper clips the pinned header as the next host's
                     // pushes it up, so it never paints over the title above.
                     .child(
@@ -653,7 +746,9 @@ impl HerdrWindow {
                             .overflow_hidden()
                             .map(|list| match search {
                                 Some(results) => list.child(results),
-                                None => list.child(spaces).children(pinned_host),
+                                None => list
+                                    .child(spaces)
+                                    .children(pinned_host.map(crate::mark_layer::covering)),
                             }),
                     )
                     .child(
@@ -670,6 +765,7 @@ impl HerdrWindow {
                             .child(
                                 div()
                                     .id("new-workspace")
+                                    .map(|button| self.sidebar_button(button, "New workspace"))
                                     .cursor_pointer()
                                     .hover(|s| s.text_color(rgb(theme.foreground)))
                                     .child("new")
@@ -681,6 +777,7 @@ impl HerdrWindow {
                                 div()
                                     .id("sidebar-menu")
                                     .debug_selector(|| "sidebar-menu".into())
+                                    .map(|button| self.sidebar_button(button, "Menu"))
                                     .cursor_pointer()
                                     .hover(|s| s.text_color(rgb(theme.foreground)))
                                     .child(label_text("menu"))
@@ -733,15 +830,25 @@ impl HerdrWindow {
                             })
                             .min_h_0()
                             .overflow_hidden()
-                            .child(
-                                header("agents", font, theme, look)
-                                    .justify_between()
-                                    .child(agents_sort(self, cx)),
-                            )
+                            // A plugin view on any listed host filters the
+                            // rows, so the header stays to say so.
+                            .when(self.config.show_agents_header || filtered, |section| {
+                                section.child(
+                                    header("agents", font, theme, look)
+                                        .justify_between()
+                                        .child(agents_sort(self, cx)),
+                                )
+                            })
                             .child(agents),
                     )
             })
-            .child(self.render_device_footer(cx))
+            .map(|sidebar| {
+                if self.device_footer_shown() {
+                    sidebar.child(self.render_device_footer(cx))
+                } else {
+                    sidebar.child(self.render_sessions_anchor())
+                }
+            })
             .child(
                 div()
                     .id("sidebar-resize")
@@ -779,6 +886,7 @@ impl HerdrWindow {
                         // Capture globally so dragging continues outside the narrow divider,
                         // and terminal handlers never receive the resize gesture's release.
                         let moving = view.clone();
+                        let device_drop = device_plan.map(|plan| plan.drop);
                         window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                             if phase == DispatchPhase::Capture {
                                 let _ = moving.update(cx, |this, cx| {
@@ -796,6 +904,11 @@ impl HerdrWindow {
                                             )
                                         },
                                         cx,
+                                    ) || this.move_device_drag(
+                                        event.position,
+                                        event.pressed_button == Some(MouseButton::Left),
+                                        device_drop.as_ref(),
+                                        cx,
                                     ) {
                                         cx.stop_propagation();
                                     } else if let Some(drag) = this.sidebar_drag {
@@ -809,10 +922,14 @@ impl HerdrWindow {
                                                 ));
                                             }
                                             SidebarDrag::Split => {
-                                                let height = (f32::from(bounds.size.height)
-                                                    - 6.
-                                                    - DEVICE_FOOTER_HEIGHT)
-                                                    .max(1.);
+                                                let footer = if this.device_footer_shown() {
+                                                    DEVICE_FOOTER_HEIGHT
+                                                } else {
+                                                    0.
+                                                };
+                                                let height =
+                                                    (f32::from(bounds.size.height) - 6. - footer)
+                                                        .max(1.);
                                                 this.sidebar_split = Some(
                                                     ((f32::from(
                                                         event.position.y - bounds.origin.y,
@@ -834,7 +951,9 @@ impl HerdrWindow {
                             {
                                 let _ = released.update(cx, |this, cx| {
                                     // A lifted row's release is its drop, not a click.
-                                    if this.release_workspace_drag(cx) {
+                                    if this.release_workspace_drag(cx)
+                                        || this.release_device_drag(cx)
+                                    {
                                         cx.stop_propagation();
                                     } else if this.sidebar_drag.take().is_some() {
                                         this.save_chrome();

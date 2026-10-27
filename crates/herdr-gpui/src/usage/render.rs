@@ -23,13 +23,13 @@ const METER_WIDTH: f32 = 40.;
 pub(super) const BAR_WINDOWS: usize = 2;
 
 impl HerdrWindow {
-    /// The provider chosen in the panel, then those closest to a limit, at
-    /// most [`super::HEADLINE`]; nothing when usage is hidden or no provider
+    /// As many providers as fit: the one chosen in the panel first, then
+    /// those closest to a limit; nothing when usage is hidden or no provider
     /// on the host has numbers yet.
-    pub(crate) fn render_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn render_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let entry = self.usage.current();
         let shown = entry
-            .map(|entry| entry.headline(&self.config.usage, super::HEADLINE, self.usage.chosen()))
+            .map(|entry| entry.headline(&self.config.usage, self.usage.chosen()))
             .unwrap_or_default();
         // A host that could not be read at all says so, but only while
         // there is nothing older to show.
@@ -46,11 +46,14 @@ impl HerdrWindow {
             .id("usage")
             .debug_selector(|| "usage".into())
             .flex()
-            .flex_shrink_1()
+            .flex_1()
             .min_w_0()
+            .h_full()
             .overflow_hidden()
+            .flex_wrap()
+            .content_start()
             .items_center()
-            .gap(px(4.));
+            .gap_x(px(4.));
         for reading in &shown {
             row = row.child(self.usage_segment(reading, now, cx));
         }
@@ -80,12 +83,14 @@ impl HerdrWindow {
             .path("icons/refresh.svg")
             .size(px(11.))
             .text_color(rgb(theme.muted));
-        // The segments clip when crowded; refresh stays in reach beside them.
+        // Full-height segments wrap below the visible row when crowded.
+        // Refresh stays outside that row, so it remains accessible.
         Some(
             div()
                 .flex()
-                .flex_shrink_1()
+                .flex_1()
                 .min_w_0()
+                .h_full()
                 .items_center()
                 .gap(px(4.))
                 .child(row)
@@ -93,6 +98,14 @@ impl HerdrWindow {
                     div()
                         .id("usage-refresh")
                         .debug_selector(|| "usage-refresh".into())
+                        .role(Role::Button)
+                        .aria_label("Refresh usage")
+                        .map(|control| {
+                            self.chrome_stop(
+                                crate::window::chrome_focus::Region::StatusBar,
+                                control,
+                            )
+                        })
                         .size(px(18.))
                         .flex_none()
                         .flex()
@@ -105,7 +118,8 @@ impl HerdrWindow {
                             refresh
                                 .with_animation(
                                     "usage-refreshing",
-                                    Animation::new(Duration::from_secs(1)).repeat(),
+                                    Animation::new(crate::motion::duration(Duration::from_secs(1)))
+                                        .repeat(),
                                     |icon, delta| {
                                         icon.with_transformation(Transformation::rotate(
                                             percentage(delta),
@@ -136,14 +150,24 @@ impl HerdrWindow {
         let bounds = Rc::new(Cell::new(Bounds::<Pixels>::default()));
         let painted = bounds.clone();
         let open = self.menu.page == Some(crate::menu::Page::Usage(provider));
+        let spoken = match reading.report.as_ref().and_then(|report| report.tightest()) {
+            Some(tightest) => format!("{} usage {}% used", provider.name(), tightest.percent()),
+            None => format!("{} usage", provider.name()),
+        };
         let mut segment = div()
             .id(SharedString::from(format!("usage-{key}")))
             .debug_selector(move || format!("usage-{key}"))
+            .role(Role::Button)
+            .aria_label(spoken)
+            .map(|control| {
+                self.chrome_stop(crate::window::chrome_focus::Region::StatusBar, control)
+            })
             .relative()
             .flex()
-            // Whole segments: a crowded bar clips the last ones rather than
-            // truncating every label mid-word.
+            // A wrapped segment occupies a whole second line and is clipped
+            // there, rather than leaving a partial provider on the first line.
             .flex_none()
+            .h_full()
             .items_center()
             .gap(px(6.))
             .px(px(6.))
@@ -153,7 +177,7 @@ impl HerdrWindow {
             .when(open, |segment| segment.bg(rgb(theme.active)))
             .child(
                 svg()
-                    .path(provider.icon())
+                    .path(super::icons::path(provider))
                     .size(px(12.))
                     .flex_none()
                     .text_color(rgb(theme.foreground)),
@@ -294,6 +318,7 @@ pub(crate) struct Hint {
 impl Render for Hint {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
+            .debug_selector(|| "hint".into())
             .px(px(8.))
             .py(px(4.))
             .rounded(px(crate::config::corners::CONTROL))

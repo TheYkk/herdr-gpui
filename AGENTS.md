@@ -16,16 +16,34 @@ Engineering guidance for agents working in this repository. Read this alongside
 
 ## Architecture
 
-Herdr GPUI is a native client of an existing local Herdr daemon, not a terminal
+Herdr UI is a native client of an existing local Herdr daemon, not a terminal
 emulator, server, or TUI wrapper. Herdr owns terminal processes and session state.
 Closing or detaching the GUI must leave the daemon and its terminals running.
 
 | Location | Responsibility |
 | --- | --- |
 | `crates/herdr-protocol` | Generation-1 wire types, framing, validation, and atomic surface patches |
+| `crates/herdr-acp` | `herdr-acp` binary run inside a Herdr pane: the only ACP client of an agent, its in-pane chat view, the attach socket Herdr UI connects to, and Herdr status reports |
+| `crates/herdr-chat-protocol` | Attach wire between `herdr-acp` and its clients: transcript model, the shared change reducer, framing, and endpoint discovery; no ACP or GPUI types |
 | `crates/herdr-client` | Discovery, socket worker, session transitions, ordered commands, and client-local activity projection |
 | `crates/herdr-gpui` | Native UI, connection bridge, presentation state, semantic input, geometry, and painting |
+| `crates/herdr-control-protocol` | The control socket between `herdr-gpui <command>` and the running app: request and response types, bounds, and the Unix socket or named pipe; no GPUI |
+| `crates/herdr-commands` | The command catalog: each command's name, default shortcuts per platform, and the daemon request it becomes against a snapshot; no GPUI (the app binds the keys and runs window commands) |
+| `crates/herdr-usage` | Plan usage of AI services on a host: the providers, their probes and sign-ins, the registry, and the read worker; no GPUI (the app draws the status bar and panel) |
+| `crates/herdr-credentials` | Where saved sign-ins live: the store policy, the macOS Keychain, Linux Secret Service, Windows Credential Manager, and the private `0600` file; GitHub and the cloud providers keep their secrets here; no GPUI |
+| `crates/herdr-github` | GitHub sign-in (device flow, pasted tokens, the GitHub CLI, additional accounts), its REST and GraphQL transport, the `[github]` config table, the read-only pull request prefetch, and explicit pull request actions; no GPUI (the app keeps the account avatars, the shared PR store, and badge colors) |
+| `crates/herdr-vcs` | Git on the checkouts the app shows: working-tree status, commit, push, and pull request creation, checkpoints kept as Git refs on each host, and the code search index; no GPUI (the app runs the workers from its views) |
+| `crates/herdr-orchestrator` | The orchestrator's backend: issue and pull request records, the per-repository SQLite database, the GitHub, GitLab, and Beads readers, agent dispatch, and the worker; also the app's cache database and private-file setup; no GPUI (the app draws the sections and pages) |
+| `crates/herdr-remote` | Machines beyond this computer's daemon: the cloud providers (one feature each), their config tables and saved devices, running scripts on any host, and Teleport's core; no GPUI (the app runs its jobs and draws its views) |
+| `crates/herdr-remote-control` | Remote control from a phone. With the `server` feature, the `herdr-remote-control` daemon: HTTPS with its own CA, dual-approval pairing, Web Push, and chats and terminal tabs through Herdr's API socket. Without it, what Herdr UI uses: the daemon's control protocol, the `[remote]` config table, the user service install, and the pairing state; no GPUI, and no Tokio without `server` |
+| `crates/herdr-updater` | The in-app update service: release checks, signed manifests, staging, the install helpers, and the release identity (`APP_ID`, `APP_VERSION`); no GPUI |
+| `crates/herdr-diagnostics` | The app's log file and crash reports: the bounded capture of the crates the app names, the writer thread and rotation, the reader the log window tails, the panic hook, and Windows minidumps; no GPUI |
+| `crates/herdr-gpui-launcher` | Windows-only windowed launcher that starts `herdr-gpui.exe` without a console window; std plus `MessageBoxW` for start failures |
+| `crates/herdr-automation` | Automation scripts (`docs/automations.md`): the sandboxed Luau state, the step catalog, schedules, caps, and the plan a person approves; no GPUI or runtime |
+| `crates/herdr-automate` | The automation daemon and its command line: schedules approved scripts per host, runs their steps through the `herdr` CLI, keeps state in SQLite, and answers `--json` reports for Herdr UI |
+| `crates/embed-resource` | No-op stand-in for GPUI's `embed-resource` build dependency, patched in so GPUI embeds no Windows manifest beside `crates/herdr-gpui/windows.manifest`; not a production crate |
 | `crates/test-support/sandbox.rs` | Shared isolated process setup for opt-in integration tests; not a production crate |
+| `crates/test-support/pe.rs` | Windows executable (PE) reader for tests that check subsystem and resources; not a production crate |
 
 - Keep dependency direction from UI to client to protocol. Protocol/client code must not depend on GPUI.
 - Keep session transitions separate from socket scheduling, and connection ownership separate from window rendering.
@@ -39,6 +57,83 @@ Closing or detaching the GUI must leave the daemon and its terminals running.
 - Define shared types once in the lowest appropriate layer and re-export them. Do not create mirror enums or convert between them through strings.
 - Do not add a crate, runtime, service container, or speculative transport abstraction without a concrete need. Sibling checkouts are references, not build dependencies.
 
+## Parallel Pull Requests
+
+Many pull requests are open at once, so code that every feature appends to is
+a merge-conflict hotspot. Most past conflicts were two branches adding lines
+at the same spot, or both bumping one hard-coded count.
+
+- Do not assert hard-coded totals such as `assert_eq!(list.len(), 55)` or
+  fixed array lengths like `[T; 98]` for lists features grow. Compare against
+  the source list, assert uniqueness or membership, or use a slice.
+- Declare each item of a growing list once. Prefer one table, or a
+  `macro_rules!` table, that generates the matching `match` arms and `ALL`
+  lists over parallel lists edited in several places.
+- Keep lists whose order carries no meaning (enum variants without derived
+  ordering, asset tables, registries) sorted between `// keep-sorted start`
+  and `// keep-sorted end` markers. Additions then land on different lines.
+  `just check-sorted` (part of `just ci`) enforces the markers and `just sort`
+  fixes them. Never mark a list whose order is shown to users or is a wire
+  contract, such as menu rows or the vendored bincode types.
+- Give a new feature's failures their own `thiserror` enum named `Error` in
+  its module's `error.rs`, with variants not prefixed by the feature name, and
+  add one `#[error(transparent)] Feature(#[from] feature::Error)` variant to
+  the crate's root `Error`, as `pane_move` and `backdrop` do, rather than a
+  run of variants in `error.rs`. The root enum stays sorted. Callers name it
+  `feature::Error`, never through an `as FeatureError` alias.
+- Wrap another crate's error the same way (`GitHub(#[from] herdr_github::Error)`).
+  Do not mirror its variants in the app's root and convert one by one: each
+  failure has one definition, and callers match the nested variant.
+- Shared state structs (`HerdrWindow`, `Config`, `herdr_settings::Settings`)
+  and their constructors keep their fields sorted. Run an initializer that has
+  an effect or depends on another (registering a subscription, creating an
+  entity, reading a value before it moves) in a `let` before the struct
+  literal, so the literal itself has no order to preserve. Derive `Debug`
+  rather than listing fields by hand; redact a private field through its own
+  type's `Debug`.
+- `just hooks` also enables `rerere`, so a resolution is reused when the same
+  conflict returns on another branch, and a `Cargo.lock` merge driver that
+  keeps one side and has Cargo rebuild it before the commit. After a clean
+  merge whose only conflict was the lockfile, the merge stops with the rebuilt
+  lockfile staged: run `git commit --no-edit` to finish it. The rebuild
+  refuses while a `Cargo.toml` or `Cargo.lock` change is unstaged, and an
+  aborted merge's pending rebuild is dropped with a warning. Squash merges
+  rebuild like merges. Cherry-picks, reverts, and rebases commit without
+  these hooks, so they stop with `Cargo.lock` conflicted: run
+  `cargo metadata`, `git add Cargo.lock`, and continue. GitHub's Update
+  branch button runs no hooks; there, run `cargo metadata` and commit
+  `Cargo.lock` by hand.
+
+## Command Line
+
+`herdr-gpui COMMAND` drives the running app over its control socket, so
+agents in Herdr panes can use what only this client shows or keeps
+(`docs/cli.md`). Agents learn about it from the managed skill in
+`skills/herdr-gpui-browser/SKILL.md`, which the app installs and refreshes.
+
+- When a feature adds something an agent or script could reasonably ask for
+  (open or focus a view, read state the app holds, change a setting, wait for
+  an event), add a command in the same change: the request in
+  `herdr-control-protocol`'s `protocol`, its handler in `control/server`,
+  parsing and output in `control/client`, its `--help` text, and tests for
+  each.
+- Do not add a command that repeats Herdr's own `herdr` CLI (workspaces,
+  terminal tabs, panes, agents, scrollback), that the app cannot really do,
+  or that skips a confirmation. Destructive or outward actions open the
+  app's own dialog, pointed at the caller's checkout or the machines named,
+  and the user confirms there; a batch of them is confirmed once. The one
+  exception is `cloud exec`, a command on a cloud machine the user saved,
+  which is the agent's own work and asks nothing, as the agent's shell does
+  not.
+- Keep the shared contract: `--json` and `--window` on every command, the
+  exit-code table in `docs/cli.md`, bounded requests and responses, and
+  targeting that refuses rather than acting in another session's window.
+- Add the command to `docs/cli.md`. When an agent should reach for it
+  unprompted, also add it to the skill's command table and, if it is a new
+  kind of task, to the skill's `description`, which is all an agent sees
+  before loading it. Keep the skill's `name`: installed copies are found
+  by it.
+
 ## Rust Conventions
 
 - Require only the capabilities an operation uses. Prefer existing traits such as `Read`, `Write`, `IntoIterator`, `AsRef<Path>`, and `AsRef<OsStr>` over specific streams, collections, or owned paths.
@@ -50,7 +145,7 @@ Closing or detaching the GUI must leave the daemon and its terminals running.
 - Parse strings at boundaries, then match on domain types. Prefer `From`, `TryFrom`, `Into`, and `TryInto` for conversions.
 - Prefer typed request/result structures when shapes are known. Preserve genuinely open-ended protocol envelopes rather than forcing a speculative schema.
 - Derive standard traits such as `Default`, `PartialEq`, and `Eq` where their semantics are valid. Compare complete values when deduplicating operations.
-- Every crate must expose its own root `Error` and `Result<T>` (`pub use error::{Error, Result}`), with errors defined using `thiserror`. Use meaningful typed variants for internal failures and match on variants, never error text.
+- Every crate must expose its own root `Error` and `Result<T, E = Error>` (`pub use error::{Error, Result}`), with errors defined using `thiserror`. Use meaningful typed variants for internal failures and match on variants, never error text.
 - Use `anyhow::Result` and context at application/reporting and test-harness boundaries, not as a replacement for typed internal errors. Keep dependency versions in workspace dependencies.
 - Never use `String` or `&str` as an error type, including `Result<(), String>`, worker-channel results, and intermediate operation state. Strings are allowed as diagnostic payloads, unchanged wire-protocol fields, and final UI display text, not as catch-all internal error wrappers.
 - Propagate errors with `?`; preserve original causes with `#[from]`/`#[source]` and retain structured operation/path context until the display boundary. Do not flatten sources with `to_string()` or `format!()` during propagation. Keep `io::Result` where an actual I/O trait or connector contract requires it, preserving typed sources when adapting errors.
@@ -64,6 +159,7 @@ Closing or detaching the GUI must leave the daemon and its terminals running.
 
 - Treat app, window, and entity contexts as UI-thread execution. A foreground `spawn` future does not make blocking work safe.
 - Never perform blocking socket/disk I/O, process waits, sleeps, or expensive background computation on the UI thread. Use the existing worker threads or GPUI background executor, then apply results through the appropriate context update.
+- Start child processes with `herdr_client::new_command`, never `Command::new` (clippy rejects it outside tests). On Windows a console child built any other way can open a window of its own.
 - Keep render and input paths thin. Render from prepared state and bounded caches; do not query the daemon, scan files, or launch processes while rendering.
 - Preserve continuously drained ordered events and the coalesced latest-state mailbox. Do not replace them with an unbounded UI event queue.
 - Route connection/startup failures through the authoritative inbox. Reconnect and detach must isolate old inboxes so delayed events and paint acknowledgements cannot affect the new connection.
@@ -73,6 +169,8 @@ Closing or detaching the GUI must leave the daemon and its terminals running.
 - Keep glyph visibility separate from decorations: spaces and wide-character continuation cells may still need underline/strikethrough painting.
 - Preserve menu input isolation, focus behavior, Unicode composition, and semantic input routing. Do not synthesize terminal keys for operations with endpoint API methods.
 - Activity indicators come from the daemon's snapshot, not guessed terminal output or a client-local seen ledger. Every client shows the same dot; do not reintroduce per-client acknowledgement without asking.
+- Animate UI that appears, disappears, moves, or changes in response to a click or hover when motion helps the user follow it: tabs, panels, popovers, revealed controls. Animate both ways, so what slides in slides back out, and reverse from where it is when interrupted. Skip it where motion would only delay the result, such as typing, scrolling content, or terminal output.
+- Time animations through `crate::motion`: read `motion::now()` instead of `Instant::now()` for start stamps and progress, pass GPUI `Animation` lengths through `motion::duration`, and prefer `motion::ENTER`/`LEAVE`, `progress`, and `Toggle` over new curves and constants. That keeps motion consistent and lets QA > Slow Animations slow every animation tenfold.
 
 ## Protocol And Safety
 
@@ -137,8 +235,14 @@ just ci
 - For linking, startup, or packaging changes, also use `just test-build` to build the release executable and exercise its CLI without a desktop.
 - The `windows` CI job checks formatting, lints every target and feature, and
   runs workspace tests with default and all features, including headless UI and
-  CLI tests. Optimized Windows builds and CLI tests run in the release workflow;
-  native GUI behavior is unproven. Keep the `cfg(unix)`/`cfg(windows)`
+  CLI tests, split like `checks` into parallel `default` and `all` legs. The
+  `windows-native` job runs `live_gui` (the `test-gui` and `test-sidebar`
+  equivalents) against a pinned `herdr.exe`, and the release-mode performance
+  budget, on both Windows runners, except the live-daemon test on
+  ARM64, where the emulated daemon ignores Enter; the optimized Windows build
+  and its installer run in `windows-package` when their inputs change, and in
+  the release workflow, which only smoke-tests the CLI of the bytes it ships
+  and requires CI to have passed on the commit. Keep the `cfg(unix)`/`cfg(windows)`
   split honest and say plainly what a platform cannot do instead of stubbing
   behavior that appears to work.
 - A `cfg` gate is only proven on the platform it names. Before handing off a
@@ -185,6 +289,15 @@ just test-perf
   guidance from the agent harness; add such lines only when the user asks for
   them in the current request.
 - Before creating a PR, review every included commit and the full diff from its base. Include a summary, exact validation commands/results, and remaining manual/native QA.
+- Run `just ci` on the exact commit before creating a PR or pushing to one, so
+  failures surface locally instead of minutes later in CI. `just setup-ci`
+  installs the tools it and the other CI-equivalent recipes need. Fix every
+  failure first; do not open or update a PR on a red or skipped run.
+- After a green run, create or update a single PR comment saying `just ci`
+  ran locally and passed: the commit SHA, the platform (for example macOS
+  arm64), and any extra recipes run (`just release-check`, `just lint-linux`,
+  `just lint-windows`). Edit that comment on later pushes rather than adding
+  a new one, and never post it for a run that failed or did not happen.
 - Include screenshots in any PR that changes something visible: before and
   after images of the real native window, showing the changed area. Add light
   and dark variants when colors or theming change, and a narrow window when

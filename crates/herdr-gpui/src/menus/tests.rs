@@ -1,19 +1,15 @@
 use super::*;
+use crate::config::Layout;
 
 #[test]
-#[cfg(feature = "qa-menu")]
 fn badge_preview_is_available_only_in_the_macos_qa_menu() {
-    let menus = menus(Layout::default());
-    let qa = menus
-        .iter()
-        .find(|menu| menu.name.as_ref() == "QA")
-        .unwrap();
+    let qa = qa_menu();
     for (label, enabled) in [("Enable badge", true), ("Disable badge preview", false)] {
         let action = qa.items.iter().find_map(|item| match item {
             MenuItem::Action { name, action, .. } if name.as_ref() == label => Some(action),
             _ => None,
         });
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", windows)) {
             assert!(
                 action
                     .unwrap()
@@ -26,13 +22,8 @@ fn badge_preview_is_available_only_in_the_macos_qa_menu() {
 }
 
 #[test]
-#[cfg(feature = "qa-menu")]
 fn qa_menu_sends_a_delayed_system_notification() {
-    let menus = menus(Layout::default());
-    let qa = menus
-        .iter()
-        .find(|menu| menu.name.as_ref() == "QA")
-        .unwrap();
+    let qa = qa_menu();
     assert!(qa.items.iter().any(|item| matches!(item,
         MenuItem::Action { name, action, .. }
             if name.as_ref() == "Send notification in 3 seconds"
@@ -41,13 +32,8 @@ fn qa_menu_sends_a_delayed_system_notification() {
 }
 
 #[test]
-#[cfg(feature = "qa-menu")]
 fn qa_menu_carries_update_progress_previews() {
-    let menus = menus(Layout::default());
-    let qa = menus
-        .iter()
-        .find(|menu| menu.name.as_ref() == "QA")
-        .unwrap();
+    let qa = qa_menu();
     for (label, expected) in [
         (
             "Show update download progress (50%)",
@@ -71,9 +57,12 @@ fn qa_menu_carries_update_progress_previews() {
 #[test]
 fn view_menu_lists_every_layout_in_groups_and_checks_the_current_one() {
     for current in LayoutMode::ALL {
-        let menus = menus(Layout {
-            mode: current,
-            ..Layout::default()
+        let menus = menus(&Config {
+            layout: Layout {
+                mode: current,
+                ..Layout::default()
+            },
+            ..Config::default()
         });
         let view = menus
             .iter()
@@ -125,18 +114,32 @@ fn view_menu_lists_every_layout_in_groups_and_checks_the_current_one() {
 }
 
 #[test]
-fn qa_menu_requires_explicit_feature() {
-    let menus = menus(Layout::default());
-    let names: Vec<_> = menus.iter().map(|menu| menu.name.as_ref()).collect();
+fn qa_menu_shows_only_with_its_feature_flag() {
+    let mut config = Config::default();
+    let names = |config: &Config| -> Vec<_> {
+        menus(config)
+            .iter()
+            .map(|menu| menu.name.to_string())
+            .collect()
+    };
     let mut expected = vec!["Herdr", "File", "Edit", "View", "Terminal", "Window"];
-    if cfg!(feature = "qa-menu") {
-        expected.push("QA");
-    }
-    assert_eq!(names, expected);
+    assert_eq!(names(&config), expected);
+    config.features.qa_menu = true;
+    expected.push("QA");
+    assert_eq!(names(&config), expected);
+}
+
+#[test]
+fn switching_the_qa_menu_flag_reinstalls_the_menu_bar() {
+    let old = Config::default();
+    let mut new = old.clone();
+    assert!(!changed(&old, &new));
+    new.features.qa_menu = true;
+    assert!(changed(&old, &new));
 }
 
 fn edit_action(label: &str) -> Box<dyn gpui::Action> {
-    menus(Layout::default())
+    menus(&Config::default())
         .into_iter()
         .find(|menu| menu.name.as_ref() == "Edit")
         .unwrap()
@@ -153,7 +156,7 @@ fn edit_action(label: &str) -> Box<dyn gpui::Action> {
 /// every macOS app shows, and labels that do not claim the keystrokes.
 #[gpui::test]
 fn edit_menu_carries_standard_items_and_shortcut_labels(cx: &mut gpui::TestAppContext) {
-    let items = &menus(Layout::default())
+    let items = &menus(&Config::default())
         .into_iter()
         .find(|menu| menu.name.as_ref() == "Edit")
         .unwrap()
@@ -230,9 +233,9 @@ fn edit_menu_items_follow_focus(cx: &mut gpui::TestAppContext) {
         cx.run_until_parked();
     };
 
-    // Without a highlighted selection, the terminal only pastes.
+    // Without a highlighted selection, the terminal pastes and selects all.
     cx.update(|window, cx| view.read(cx).focus.clone().focus(window, cx));
-    assert_eq!(available(cx), ["Paste"]);
+    assert_eq!(available(cx), ["Paste", "Select All"]);
 
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -286,10 +289,11 @@ fn edit_menu_items_follow_focus(cx: &mut gpui::TestAppContext) {
 
 /// The font size items are the only way to reach these commands from the
 /// macOS menu bar, and each must dispatch the catalog command rather than
-/// an action of its own; full screen follows them, as in other Mac apps.
+/// an action of its own; full screen follows them, as in other Mac apps,
+/// with zen mode, which also takes over the whole window, beside it.
 #[test]
-fn view_menu_carries_the_font_size_and_full_screen_commands() {
-    let menus = menus(Layout::default());
+fn view_menu_carries_the_font_size_full_screen_and_zen_commands() {
+    let menus = menus(&Config::default());
     let view = menus
         .iter()
         .find(|menu| menu.name.as_ref() == "View")
@@ -308,6 +312,7 @@ fn view_menu_carries_the_font_size_and_full_screen_commands() {
         ("Reset Font Size", Command::ResetFontSize),
         ("Devices Overview", Command::DevicesOverview),
         ("Toggle Full Screen", Command::ToggleFullScreen),
+        ("Toggle Zen Mode", Command::ToggleZenMode),
     ];
     assert_eq!(actions.len(), expected.len());
     for ((name, action), (label, command)) in actions.iter().zip(expected) {
@@ -333,7 +338,7 @@ fn action_names(menu: &Menu) -> Vec<&str> {
 #[cfg(target_os = "macos")]
 #[gpui::test]
 fn macos_menus_carry_hide_and_minimize(cx: &mut gpui::TestAppContext) {
-    let menus = menus(Layout::default());
+    let menus = menus(&Config::default());
     let herdr = menus
         .iter()
         .find(|menu| menu.name.as_ref() == "Herdr")
@@ -389,7 +394,7 @@ fn macos_menus_carry_hide_and_minimize(cx: &mut gpui::TestAppContext) {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn hide_and_minimize_are_macos_only() {
-    let menus = menus(Layout::default());
+    let menus = menus(&Config::default());
     let herdr = menus
         .iter()
         .find(|menu| menu.name.as_ref() == "Herdr")
@@ -411,6 +416,16 @@ fn hide_and_minimize_are_macos_only() {
         .unwrap();
     assert_eq!(
         action_names(window),
-        ["New Window", "Cycle Through Windows", "Logs"]
+        [
+            "New Window",
+            "Cycle Through Windows",
+            "Close Window",
+            "Logs"
+        ]
     );
 }
+
+/// View > Tab Layout lists every tab layout and checks the one in use.
+mod tab_layout;
+
+mod slow_animations;

@@ -16,9 +16,9 @@ fn disconnected_host_switch_discovers_services_with_usage_off_without_reopening_
         source.config.usage.show = false;
         source.endpoints[0].live.status = ConnectionStatus::Connecting;
         let target = source.endpoints[0].connection.target.clone();
-        let mut reply = source.usage.detection_peer_for_test();
+        let mut reply = source.usage.detection_peer();
         source.usage.request_detection(&target);
-        reply(&["codex"]);
+        reply(&["codex"]).unwrap();
         source.usage.poll(
             None,
             &source.config.usage,
@@ -54,7 +54,7 @@ fn disconnected_host_switch_discovers_services_with_usage_off_without_reopening_
     cx.run_until_parked();
     draw(cx);
     assert!(cx.debug_bounds("settings-usage-provider-codex").is_none());
-    reply(&["gemini"]);
+    reply(&["gemini"]).unwrap();
     source.update(cx, |source, cx| {
         source.usage.poll(
             None,

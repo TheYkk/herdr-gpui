@@ -36,6 +36,7 @@ fn only_a_remote_shell_failure_retries_through_powershell() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_shell_that_cannot_run_the_bridge_reports_its_exit_code() {
     let mut command = Command::new("/bin/sh");
@@ -109,7 +110,7 @@ fn powershell_ends_its_ready_banner_with_crlf() {
     let mut stray = scripted(bytes(b"herdr-remote-output-ready:1\r\r\n"));
     assert!(matches!(
         await_ready(&mut stray, &AtomicBool::new(false), Instant::now()),
-        Err(Error::SshClosed)
+        Err(crate::Error::Ssh(Error::Closed))
     ));
 }
 

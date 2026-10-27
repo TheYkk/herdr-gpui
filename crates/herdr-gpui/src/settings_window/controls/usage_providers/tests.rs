@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
-use crate::settings_window::controls::{preferences::PreferenceIo, tests::skill_load};
+use crate::settings_window::{controls::preferences::PreferenceIo, tests::skill_load};
 use gpui::VisualTestContext;
 use std::sync::{Arc, mpsc};
 
@@ -41,9 +41,7 @@ fn install(
 ) {
     let source = view.read_with(cx, |view, _| view.source.upgrade().unwrap());
     source.update(cx, |source, cx| {
-        source
-            .usage
-            .set_current_for_test(usage::Host::Local, readings);
+        source.usage = usage::Usage::showing(usage::Host::Local, readings);
         cx.notify();
     });
     cx.run_until_parked();
@@ -60,7 +58,7 @@ fn recording(
                 captured.send(edit).unwrap();
                 Ok(())
             }),
-            load: skill_load,
+            load: Arc::new(skill_load),
         });
     });
     cx.simulate_resize(size(px(960.), px(4000.)));

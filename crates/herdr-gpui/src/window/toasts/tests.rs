@@ -6,6 +6,8 @@ use gpui::{TestAppContext, px, size};
 use std::time::Instant;
 
 mod badge;
+mod described;
+mod leaving;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod local_peer_warning;
 

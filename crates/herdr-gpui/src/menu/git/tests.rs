@@ -37,10 +37,11 @@ fn only_a_local_daemon_checkout_is_tracked(cx: &mut TestAppContext) {
             assert_eq!(input.repo_key.as_deref(), Some(REPO_KEY));
             assert_eq!(input.branch, "develop");
             assert_eq!(input.checkout, None, "the checkout is resolved by Git");
-            // A workspace without worktree metadata cannot be acted on.
+            // A folder the daemon reports no branch for is not a checkout.
             if let Some(snapshot) = view.live.snapshot.as_ref().map(Arc::clone) {
                 let mut snapshot = (*snapshot).clone();
                 snapshot.focused_workspace_id = Some("w0".into());
+                snapshot.workspaces[0].branch = None;
                 view.live.snapshot = Some(Arc::new(snapshot));
             }
             assert!(view.git_input().is_none());
@@ -77,9 +78,7 @@ fn a_cached_pull_request_is_named_and_only_an_open_one_can_be_opened(cx: &mut Te
             );
             view.menu.github = crate::github::Auth::connected_fixture();
             let pr = crate::pull_request::fixture().unwrap();
-            view.menu
-                .pr_cache
-                .seed(input.clone(), pr, std::time::Instant::now());
+            view.seed_pr(input.clone(), pr, std::time::Instant::now());
             assert_eq!(view.git_pull_request().map(|pr| pr.number), Some(8));
             assert_eq!(
                 view.git_rows().last().map(|(_, label)| label.clone()),
@@ -100,8 +99,7 @@ fn a_cached_pull_request_is_named_and_only_an_open_one_can_be_opened(cx: &mut Te
             let _ = window.draw(cx);
         });
         let panel = cx.debug_bounds("menu-panel").unwrap();
-        let chrome = crate::titlebar::HEIGHT
-            + crate::worktree_banner::reserved(env!("HERDR_BUILD_WORKTREE") == "1");
+        let chrome = crate::titlebar::HEIGHT;
         assert!(panel.top() >= px(chrome + 6.));
         assert!(panel.bottom() <= px(height - 12.));
         assert!(panel.left() >= px(12.) && panel.right() <= px(width - 12.));
@@ -146,9 +144,7 @@ fn a_cached_pull_request_is_named_and_only_an_open_one_can_be_opened(cx: &mut Te
             // the next action is creating another one.
             let mut merged = crate::pull_request::fixture().unwrap();
             merged.state = PrState::Merged;
-            view.menu
-                .pr_cache
-                .seed(input, merged, std::time::Instant::now());
+            view.seed_pr(input, merged, std::time::Instant::now());
             assert_eq!(view.git_pull_request().map(|pr| pr.number), Some(8));
             assert_eq!(
                 view.git_rows().last().map(|(_, label)| label.clone()),
@@ -180,6 +176,7 @@ fn the_popup_says_when_it_is_waiting_on_github(cx: &mut TestAppContext) {
             view.menu.pr_cache.scope(
                 (0, 1, "boot".into()),
                 Arc::new("fixture".into()),
+                "fixture",
                 crate::pull_request::Origin::Local,
             );
             view.menu
@@ -196,9 +193,7 @@ fn the_popup_says_when_it_is_waiting_on_github(cx: &mut TestAppContext) {
             // The lookup finished: nothing queued, the answer cached.
             view.menu.pr_cache.retain(|_| false);
             let pr = crate::pull_request::fixture().unwrap();
-            view.menu
-                .pr_cache
-                .seed(input, pr, std::time::Instant::now());
+            view.seed_pr(input, pr, std::time::Instant::now());
             cx.notify();
         })
     });
@@ -272,7 +267,7 @@ fn the_menu_commits_through_a_dialog_and_refuses_an_empty_message(cx: &mut TestA
             view.submit_git_commit(cx);
             assert_eq!(
                 view.menu.error.as_deref(),
-                Some(crate::Error::GitCommitMessage.to_string().as_str())
+                Some(crate::git::Error::CommitMessage.to_string().as_str())
             );
             assert_eq!(
                 view.menu.page,

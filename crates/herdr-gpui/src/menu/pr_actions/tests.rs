@@ -23,12 +23,10 @@ fn open(
         view.update(cx, |view, cx| {
             view.git = crate::git::Git::fixture(input(), Default::default());
             view.menu.github = crate::github::Auth::connected_fixture();
-            view.menu
-                .pr_cache
-                .seed(input(), pr, std::time::Instant::now());
+            view.seed_pr(input(), pr, std::time::Instant::now());
             view.pr_actions.track(
                 view.git_open_pull_request()
-                    .and_then(|pr| crate::pr_actions::Target::try_from(pr).ok()),
+                    .and_then(|pr| crate::pr_actions::Target::try_from(&*pr).ok()),
             );
             view.open_git_menu(point(px(860.), px(20.)), window, cx);
         })
@@ -75,9 +73,7 @@ fn an_open_pull_request_offers_review_comment_and_merge(cx: &mut TestAppContext)
         change(&mut pr);
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
-                view.menu
-                    .pr_cache
-                    .seed(input(), pr, std::time::Instant::now());
+                view.seed_pr(input(), pr, std::time::Instant::now());
                 let labels = labels(view);
                 assert!(labels.contains(&"Comment...".to_owned()));
                 assert!(!labels.contains(&"Merge...".to_owned()));
@@ -89,9 +85,7 @@ fn an_open_pull_request_offers_review_comment_and_merge(cx: &mut TestAppContext)
     pr.id.clear();
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
-            view.menu
-                .pr_cache
-                .seed(input(), pr, std::time::Instant::now());
+            view.seed_pr(input(), pr, std::time::Instant::now());
             view.update_pr_actions(std::time::Instant::now());
             // Commit, push, and opening the pull request.
             assert_eq!(labels(view).len(), 3);
@@ -156,16 +150,18 @@ fn a_branch_that_moved_after_the_dialog_opened_is_not_merged(cx: &mut TestAppCon
             view.activate_git_row(Row::Merge, window, cx);
             let mut pushed = crate::pull_request::fixture().unwrap();
             pushed.head_ref_oid = "f".repeat(40);
-            view.menu
-                .pr_cache
-                .seed(input(), pushed, std::time::Instant::now());
+            view.seed_pr(input(), pushed, std::time::Instant::now());
             view.update_pr_actions(std::time::Instant::now());
             view.submit_pr_merge(cx);
             assert!(view.pr_actions.running().is_none());
             assert_eq!(view.menu.page, Some(Page::PrMerge));
             assert_eq!(
                 view.menu.error.as_deref(),
-                Some(crate::Error::PrMergeChanged.to_string().as_str())
+                Some(
+                    herdr_github::pr_actions::Error::MergeChanged
+                        .to_string()
+                        .as_str()
+                )
             );
         })
     });
@@ -181,7 +177,11 @@ fn commenting_refuses_an_empty_body_and_queues_a_written_one(cx: &mut TestAppCon
             view.submit_pr_comment(cx);
             assert_eq!(
                 view.menu.error.as_deref(),
-                Some(crate::Error::PrCommentBody.to_string().as_str())
+                Some(
+                    herdr_github::pr_actions::Error::CommentBody
+                        .to_string()
+                        .as_str()
+                )
             );
             assert!(view.pr_actions.running().is_none());
             if let Some(dialog) = view.menu.input.as_mut() {

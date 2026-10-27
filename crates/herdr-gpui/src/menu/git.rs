@@ -62,6 +62,9 @@ impl HerdrWindow {
     pub(crate) fn update_git(&mut self) -> bool {
         let now = std::time::Instant::now();
         let mut changed = self.git.track(self.git_input(), self.active, now);
+        self.git.set_counted(
+            self.config.sidebar_style.change_counts == crate::config::ChangeCounts::Local,
+        );
         self.git
             .track_listed(self.listed_git_inputs(), self.active, now);
         changed |= self.git.poll(now);
@@ -98,8 +101,11 @@ impl HerdrWindow {
     }
 
     /// The checkout the chrome acts on: the focused workspace's, when it is one
-    /// this client may run Git in.
-    pub(super) fn git_input(&self) -> Option<crate::pull_request::Input> {
+    /// this client may run Git in. The daemon only attaches worktree metadata
+    /// to a worktree made through Herdr, so a space merely opened in a
+    /// repository is named by its directory, which the worker resolves and
+    /// verifies as the pull request lookup does; see `workspace_input`.
+    pub(crate) fn git_input(&self) -> Option<crate::pull_request::Input> {
         if !self.local_git_endpoint() {
             return None;
         }
@@ -116,11 +122,7 @@ impl HerdrWindow {
                     .iter()
                     .find(|workspace| workspace.focused)
             })?;
-        crate::pull_request::repository_input(
-            workspace.worktree.as_ref(),
-            workspace.branch.as_deref(),
-        )
-        .ok()
+        crate::pull_request::workspace_input(workspace, &crate::pull_request::Origin::Local).ok()
     }
 
     pub(crate) fn open_git_menu(
@@ -152,16 +154,20 @@ impl HerdrWindow {
 
     /// The pull request already prefetched for the focused branch, in whatever
     /// lifecycle it is in. Reading the cache never schedules work.
-    pub(crate) fn git_pull_request(&self) -> Option<&crate::pull_request::PullRequest> {
+    pub(crate) fn git_pull_request(
+        &self,
+    ) -> Option<std::cell::Ref<'_, crate::pull_request::PullRequest>> {
+        // The Git probe only tracks this machine's checkouts, read with its
+        // main account.
         let input = self.git.tracked()?;
+        let view = crate::pull_request::View {
+            origin: crate::pull_request::Origin::Local,
+            login: self.main_tokens()?.key(),
+        };
         self.menu
             .github
             .connected()
-            .then(|| {
-                self.menu
-                    .pr_cache
-                    .peek(input.repo_key.as_deref()?, &input.branch)
-            })
+            .then(|| self.menu.pr_cache.peek_input(&view, input))
             .flatten()
     }
 
@@ -176,7 +182,9 @@ impl HerdrWindow {
 
     /// Only an open pull request can be opened; a merged or closed one leaves
     /// creating the next one as the action.
-    pub(super) fn git_open_pull_request(&self) -> Option<&crate::pull_request::PullRequest> {
+    pub(super) fn git_open_pull_request(
+        &self,
+    ) -> Option<std::cell::Ref<'_, crate::pull_request::PullRequest>> {
         self.git_pull_request()
             .filter(|pr| pr.state == PrState::Open)
     }
@@ -243,13 +251,7 @@ impl HerdrWindow {
     }
 
     fn start_git(&mut self, action: Action) {
-        let token = self
-            .menu
-            .github
-            .profile
-            .as_ref()
-            .map(|profile| profile.token.clone());
-        if let Err(error) = self.git.start(action, token) {
+        if let Err(error) = self.git.start(action, self.main_tokens()) {
             self.menu.error = Some(error.to_string());
         } else {
             self.menu.error = None;
@@ -403,7 +405,7 @@ impl HerdrWindow {
                     .gap(px(8.))
                     .child(
                         div()
-                            .text_color(rgb(pr.color(theme)))
+                            .text_color(rgb(crate::pull_request::color(&pr, theme)))
                             .child(format!("#{}", pr.number)),
                     )
                     .child(
@@ -412,7 +414,7 @@ impl HerdrWindow {
                             .py(px(2.))
                             .rounded(px(crate::config::corners::CONTROL))
                             .bg(rgb(theme.active))
-                            .text_color(rgb(pr.color(theme)))
+                            .text_color(rgb(crate::pull_request::color(&pr, theme)))
                             .child(pr.lifecycle()),
                     )
                     .child(div().flex_1())
@@ -488,7 +490,10 @@ impl HerdrWindow {
                                 .text_color(rgb(theme.muted))
                                 .with_animation(
                                     "git-menu-pr-loading",
-                                    Animation::new(std::time::Duration::from_secs(1)).repeat(),
+                                    Animation::new(crate::motion::duration(
+                                        std::time::Duration::from_secs(1),
+                                    ))
+                                    .repeat(),
                                     |icon, delta| {
                                         icon.with_transformation(Transformation::rotate(
                                             percentage(delta),

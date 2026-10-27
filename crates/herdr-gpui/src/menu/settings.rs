@@ -3,11 +3,7 @@
 //! thread, and a superseded load cannot overwrite a newer one.
 
 use super::{Page, accent};
-use crate::{
-    HerdrWindow,
-    config::{Config, FONT_SIZE_RANGE, FONT_SIZE_STEP, FontFace},
-    keymap::Reach,
-};
+use crate::{HerdrWindow, config::Config, keymap::Reach};
 use gpui::{prelude::*, *};
 use herdr_client::protocol::ClientShellCommand;
 use std::borrow::Cow;
@@ -41,7 +37,7 @@ impl HerdrWindow {
         let Ok(path) = Config::local_path() else {
             return;
         };
-        let daemon = crate::config::daemon_config_path(|key| std::env::var_os(key));
+        let daemon = crate::config::daemon_config_path(herdr_client::local_var);
         let executor = cx.background_executor().clone();
         let mut theme = self.config.theme.clone();
         self.config_watch = Some(cx.spawn(async move |this, cx| {
@@ -79,10 +75,8 @@ impl HerdrWindow {
                     if watch.observe(sample)
                         && this.config_load.is_none()
                         && this.settings.task.is_none()
-                        && !this.font_size_saves.is_busy()
-                        && !matches!(this.menu.page, Some(Page::Themes | Page::Fonts))
+                        && !matches!(this.menu.page, Some(Page::Themes))
                         && !this.theme_save_in_flight()
-                        && !this.native_settings_save_in_flight()
                     {
                         this.load_gui_config(cx);
                         this.load_shared_settings(cx);
@@ -127,32 +121,8 @@ impl HerdrWindow {
         crate::settings_window::open(cx.weak_entity(), cx);
     }
 
-    // Existing modal font/theme pickers still return to their own preferences page.
-    #[cfg(any(test, all(feature = "integration-test", target_os = "macos")))]
-    pub(crate) fn open_preferences_fixture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.open_menu(window, cx) {
-            return;
-        }
-        self.menu.page = Some(Page::Preferences);
-        self.menu.preferences_scroll.set_offset(Point::default());
-        self.load_shared_settings(cx);
-        self.select_settings_tab(self.settings.tab, window, cx);
-    }
-
-    pub(crate) fn change_font_size(
-        &mut self,
-        face: FontFace,
-        direction: f32,
-        cx: &mut Context<Self>,
-    ) {
-        let current = face.size(&self.config);
-        let size = (current + direction * FONT_SIZE_STEP)
-            .clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
-        self.set_font_size(face, size, cx);
-    }
-
     pub(crate) fn reload_gui_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.theme_save_in_flight() || self.native_settings_save_in_flight() {
+        if self.theme_save_in_flight() {
             return;
         }
         self.load_gui_config(cx);
@@ -160,9 +130,6 @@ impl HerdrWindow {
     }
 
     pub(crate) fn load_gui_config(&mut self, cx: &mut Context<Self>) {
-        if self.native_settings_save_in_flight() {
-            return;
-        }
         // Enumerating installed families is slow, so it rides the same
         // background load as parsing rather than the UI thread.
         let light = crate::app::light_appearance(cx);
@@ -188,11 +155,12 @@ impl HerdrWindow {
         load: impl FnOnce() -> crate::Result<(Config, crate::config::Theme)> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
-        if self.config_load.is_some() || self.font_size_saves.is_busy() {
+        if self.config_load.is_some() {
             return;
         }
         let theme_revision = crate::settings_window::theme_load_revision(cx);
         let layout_revision = crate::settings_window::layout_load_revision(cx);
+        let sidebar_revision = crate::settings_window::sidebar_load_revision(cx);
         // Loaders resolve the theme for the appearance when they start.
         let light = crate::app::light_appearance(cx);
         let load = cx.background_executor().spawn(async move { load() });
@@ -200,29 +168,32 @@ impl HerdrWindow {
             let loaded = load.await;
             let _ = this.update(cx, |this, cx| {
                 this.config_load = None;
-                let native_reload = std::mem::take(&mut this.settings.native_reloading);
                 this.config_load_revision = this.config_load_revision.wrapping_add(1);
                 // Apply a coherent pair only after both have loaded successfully.
                 match loaded {
                     Ok((mut config, mut theme)) => {
                         crate::settings_window::apply_loaded_layout(&mut config, layout_revision, cx);
+                        crate::settings_window::apply_loaded_sidebar(&mut config, sidebar_revision, cx);
                         crate::settings_window::apply_loaded_theme(&mut config, &mut theme, theme_revision, cx);
                         if let Some(shared) = &this.settings.shared {
                             config.apply_shared_notifications(shared);
                         }
-                        // A reload discards session zoom; queued Settings edits
-                        // remain visible but do not become the saved baseline yet.
+                        // A reload discards session zoom.
                         this.configured_terminal_size = config.terminal.size;
                         cx.set_global(crate::app::InitialAppearance {
                             config: config.clone(),
                             theme: theme.clone(),
                             error: None,
                         });
+                        crate::caffeine::set_scope(config.status_bar.keep_awake_scope, cx);
+                        let menus_changed = crate::menus::changed(&this.config, &config);
                         if config.keybindings != this.config.keybindings {
                             crate::actions::rebind_keys(cx);
-                        } else if config.layout.mode != this.config.layout.mode {
-                            // The View menu checks the layout in use.
+                        } else if menus_changed {
                             crate::menus::install(cx);
+                        }
+                        if menus_changed {
+                            this.close_stale_application_menu(cx);
                         }
                         if this.config.notifications.delivery() == crate::config::NotificationDelivery::Off
                             && config.notifications.delivery() != crate::config::NotificationDelivery::Off
@@ -250,18 +221,14 @@ impl HerdrWindow {
                             theme: this.theme.clone(),
                             error: None,
                         });
-                        this.font_size_saves.apply_pending(&mut config);
                         this.config = config;
+                        this.sound.set_volume(this.config.sound.volume);
                         this.gui_config_diagnostic.sync(this.config.diagnostic().as_deref());
                         crate::settings_window::apply_loaded_theme(&mut this.config, &mut this.theme, theme_revision, cx);
                         this.tick_toasts(
                             this.menu.page.is_some() || this.toasts_hidden,
                             std::time::Instant::now(),
                         );
-                        if native_reload {
-                            this.settings.native_status =
-                                Some("GUI config saved and applied".into());
-                        }
                         crate::log_window::set_appearance(&this.config, &this.theme, cx);
                         this.wheel = Default::default();
                         this.last_queued_options = None;
@@ -270,11 +237,6 @@ impl HerdrWindow {
                     Err(error) => {
                         tracing::warn!(%error, "Could not load GUI config; keeping current settings");
                         let message = format!("Load GUI config: {error}");
-                        if native_reload {
-                            this.settings.native_status =
-                                Some("GUI config saved; appearance reload failed".into());
-                            this.settings.native_error = Some(message.clone());
-                        }
                         this.local_error = Some(message);
                     }
                 }
@@ -283,17 +245,20 @@ impl HerdrWindow {
                 // credential under the settings already in effect.
                 let mut reloaded = false;
                 if this.avatars.is_some() {
-                    reloaded = this.menu.github.initialize(&this.config);
+                    reloaded = this.menu.github.initialize(&this.config.github);
                     for auth in this.menu.github_hosts.values_mut() {
-                        reloaded |= auth.initialize(&this.config);
+                        reloaded |= auth.initialize(&this.config.github);
                     }
+                    for account in &mut this.menu.github_accounts {
+                        reloaded |= account.auth.initialize(&this.config.github);
+                    }
+                    this.sync_github_accounts();
                 }
                 if reloaded {
                     this.menu.pr_cache.clear();
                     this.menu.pr.clear();
                     this.menu.pr_connection = None;
                 }
-                this.flush_font_sizes(cx);
                 cx.notify();
             });
         }));
@@ -345,6 +310,8 @@ impl HerdrWindow {
             let group = match info.command {
                 Command::Workspace
                 | Command::NewWorktree
+                | Command::OpenWorktree
+                | Command::RemoveWorktree
                 | Command::EditWorktreeNote
                 | Command::Tab
                 | Command::SplitRight
@@ -359,8 +326,12 @@ impl HerdrWindow {
                 | Command::EditScrollback
                 | Command::ClosePane
                 | Command::CloseTab
+                | Command::ReopenClosedTab
                 | Command::NewBrowserTab
                 | Command::OpenOrchestrator
+                | Command::ReviewChanges
+                | Command::GitMenu
+                | Command::ToggleAnnotate
                 | Command::SplitEditor
                 | Command::MoveTabPrevious
                 | Command::MoveTabNext
@@ -375,6 +346,7 @@ impl HerdrWindow {
                 | Command::ResizeDown
                 | Command::ResizeMode
                 | Command::RenamePane
+                | Command::MovePane
                 | Command::RenameWorkspace
                 | Command::CloseWorkspace => 0,
                 Command::NextTab
@@ -402,7 +374,12 @@ impl HerdrWindow {
                 Command::NewWindow
                 | Command::ToggleSidebar
                 | Command::OpenCode
+                | Command::OpenPx0
+                | Command::RemotePair
                 | Command::ToggleStatusBar
+                | Command::FocusNextRegion
+                | Command::FocusPreviousRegion
+                | Command::ToggleZenMode
                 | Command::DevicesOverview
                 | Command::IncreaseFontSize
                 | Command::DecreaseFontSize
@@ -412,6 +389,7 @@ impl HerdrWindow {
                 | Command::Sessions
                 | Command::Themes
                 | Command::Palette
+                | Command::ResumePalette
                 | Command::Detach
                 | Command::Reconnect
                 | Command::Quit
@@ -420,6 +398,7 @@ impl HerdrWindow {
                 | Command::InstallBrowserSkill
                 | Command::ToggleFullScreen
                 | Command::CycleWindows
+                | Command::CloseWindow
                 | Command::ReloadConfig => 2,
                 Command::OpenNotificationTarget => 1,
             };

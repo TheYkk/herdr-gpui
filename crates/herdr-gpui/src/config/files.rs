@@ -1,10 +1,11 @@
 //! The config files on disk: locking, migration, managed defaults refresh,
 //! and targeted edits to the local overrides file.
+use super::Error;
 use super::{
-    Config, DEFAULT_CONFIG, Daemon, FONT_SIZE_RANGE, FontFace, KeybindingSource, LOCAL_CONFIG,
-    LayoutMode, MANAGED_HEADER,
+    Config, DEFAULT_CONFIG, Daemon, FONT_SIZE_RANGE, FontFace, LOCAL_CONFIG, LayoutMode,
+    MANAGED_HEADER,
 };
-use crate::{Error, Result, contrast::Contrast};
+use crate::{Result, contrast::Contrast};
 use std::{
     fs,
     io::{ErrorKind, Write},
@@ -19,7 +20,7 @@ impl Config {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        fs::create_dir_all(parent).map_err(|error| Error::from(error).at_path(parent))?;
+        fs::create_dir_all(parent).map_err(|error| crate::Error::from(error).at_path(parent))?;
         let lock_path = path.with_extension("lock");
         let lock = fs::OpenOptions::new()
             .read(true)
@@ -30,17 +31,17 @@ impl Config {
             .inspect_err(|error| {
                 tracing::warn!(operation = "config_lock_open", kind = ?error.kind(), raw_os_error = ?error.raw_os_error(), "Config lock failed");
             })
-            .map_err(|error| Error::from(error).at_path(&lock_path))?;
+            .map_err(|error| crate::Error::from(error).at_path(&lock_path))?;
         lock.lock()
             .inspect_err(|error| {
                 tracing::warn!(operation = "config_lock_acquire", kind = ?error.kind(), raw_os_error = ?error.raw_os_error(), "Config lock failed");
             })
-            .map_err(|error| Error::from(error).at_path(&lock_path))?;
+            .map_err(|error| crate::Error::from(error).at_path(&lock_path))?;
         let local = path.with_extension("local.toml");
         let original = match fs::read_to_string(path) {
             Ok(text) => Some(text),
             Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(error) => return Err(Error::from(error).at_path(path)),
+            Err(error) => return Err(crate::Error::from(error).at_path(path)),
         };
         let legacy = original
             .as_deref()
@@ -52,24 +53,25 @@ impl Config {
         }
         match fs::read_to_string(&local) {
             Ok(text) if legacy.is_some_and(|legacy| legacy != text) => {
-                return Err(Error::ConfigMigrationConflict {
+                return Err(Error::MigrationConflict {
                     original: path.into(),
                     local,
-                });
+                }
+                .into());
             }
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 let mut file = tempfile::NamedTempFile::new_in(parent)
-                    .map_err(|error| Error::from(error).at_path(&local))?;
+                    .map_err(|error| crate::Error::from(error).at_path(&local))?;
                 file.write_all(legacy.unwrap_or(LOCAL_CONFIG).as_bytes())
-                    .map_err(|error| Error::from(error).at_path(&local))?;
+                    .map_err(|error| crate::Error::from(error).at_path(&local))?;
                 file.as_file()
                     .sync_all()
-                    .map_err(|error| Error::from(error).at_path(&local))?;
+                    .map_err(|error| crate::Error::from(error).at_path(&local))?;
                 file.persist_noclobber(&local)
-                    .map_err(|error| Error::from(error.error).at_path(&local))?;
+                    .map_err(|error| crate::Error::from(error.error).at_path(&local))?;
             }
-            Err(error) => return Err(Error::from(error).at_path(&local)),
+            Err(error) => return Err(crate::Error::from(error).at_path(&local)),
         }
         if legacy.is_some() {
             // Windows FlushFileBuffers requires write access, including when
@@ -78,13 +80,13 @@ impl Config {
                 .write(true)
                 .open(&local)
                 .and_then(|file| file.sync_all())
-                .map_err(|error| Error::from(error).at_path(&local))?;
+                .map_err(|error| crate::Error::from(error).at_path(&local))?;
             // Publish the migration copy durably before replacing the only old
             // copy. Windows does not expose directory sync through std::fs.
             #[cfg(unix)]
             fs::File::open(parent)
                 .and_then(|directory| directory.sync_all())
-                .map_err(|error| Error::from(error).at_path(parent))?;
+                .map_err(|error| crate::Error::from(error).at_path(parent))?;
         }
         if original.as_deref() != Some(DEFAULT_CONFIG) {
             write_config(path, DEFAULT_CONFIG)?;
@@ -280,69 +282,6 @@ impl Config {
         result.map_err(|error| error.at_path(path))
     }
 
-    /// Persist one device's keybinding source, keeping the rest of the local
-    /// file. Local is the default, so choosing it removes the entry.
-    pub(crate) fn save_device_keybindings(profile: &str, source: KeybindingSource) -> Result<()> {
-        let (_lock, local) = Self::prepare_files(&Self::path()?)?;
-        Self::save_device_keybindings_path(profile, source, &local)
-    }
-
-    pub(super) fn save_device_keybindings_path(
-        profile: &str,
-        source: KeybindingSource,
-        path: &Path,
-    ) -> Result<()> {
-        if !herdr_client::valid_profile_id(profile) {
-            return Err(Error::InvalidDeviceId(profile.to_owned()));
-        }
-        let result = (|| -> Result<()> {
-            let text = match fs::read_to_string(path) {
-                Ok(text) => text,
-                Err(error) if error.kind() == ErrorKind::NotFound => LOCAL_CONFIG.into(),
-                Err(error) => return Err(error.into()),
-            };
-            let mut document = text.parse::<toml_edit::DocumentMut>()?;
-            match source {
-                KeybindingSource::Server => {
-                    let mut devices = toml_edit::Table::new();
-                    devices.set_implicit(true);
-                    let device = document
-                        .entry("devices")
-                        .or_insert(toml_edit::Item::Table(devices))
-                        .as_table_like_mut()
-                        .ok_or(Error::InvalidDevicesTable)?
-                        .entry(profile)
-                        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
-                        .as_table_like_mut()
-                        .ok_or(Error::InvalidDevicesTable)?;
-                    device.insert("keybindings", toml_edit::value("server"));
-                }
-                KeybindingSource::Local => {
-                    let Some(devices) = document
-                        .get_mut("devices")
-                        .and_then(toml_edit::Item::as_table_like_mut)
-                    else {
-                        return Ok(());
-                    };
-                    if let Some(device) = devices
-                        .get_mut(profile)
-                        .and_then(toml_edit::Item::as_table_like_mut)
-                    {
-                        device.remove("keybindings");
-                        if device.is_empty() {
-                            devices.remove(profile);
-                        }
-                    }
-                    if devices.is_empty() {
-                        document.remove("devices");
-                    }
-                }
-            }
-            write_config(path, &document.to_string())
-        })();
-        result.map_err(|error| error.at_path(path))
-    }
-
     /// Persist only the Agents section visibility, keeping the rest of the local file.
     pub(crate) fn save_show_agents(show: bool) -> Result<()> {
         let (_lock, local) = Self::prepare_files(&Self::path()?)?;
@@ -404,7 +343,7 @@ impl Config {
         path: &Path,
     ) -> Result<()> {
         if family.is_some_and(|name| name.trim().is_empty()) {
-            return Err(Error::EmptyFontFamily("fonts"));
+            return Err(Error::EmptyFontFamily("fonts").into());
         }
         let result = (|| -> Result<()> {
             let text = fs::read_to_string(path)?;
@@ -438,7 +377,7 @@ impl Config {
     pub(super) fn save_font_sizes_path(sizes: &[(FontFace, f32)], path: &Path) -> Result<()> {
         for &(face, size) in sizes {
             if !size.is_finite() || !FONT_SIZE_RANGE.contains(&size) {
-                return Err(Error::InvalidFontSize(face.name()));
+                return Err(Error::InvalidFontSize(face.name()).into());
             }
         }
         let result = (|| -> Result<()> {
@@ -479,5 +418,5 @@ pub(super) fn write_config(path: &Path, text: &str) -> Result<()> {
         file.persist(&target).map_err(|error| error.error)?;
         Ok(())
     })();
-    result.map_err(|error| Error::from(error).at_path(path))
+    result.map_err(|error| crate::Error::from(error).at_path(path))
 }

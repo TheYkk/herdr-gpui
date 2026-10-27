@@ -8,18 +8,23 @@ use herdr_client::protocol::{
 };
 use std::sync::Arc;
 
+mod wsl_panes;
+
 #[test]
-fn quotes_shell_metacharacters_apostrophes_and_unicode_without_execution() {
+fn escapes_shell_metacharacters_and_keeps_plain_paths_bare() {
     let paths = [
+        "/Users/me/Screenshot.png",
         "/tmp/a b",
         "/tmp/it's",
-        "/tmp/$(touch bad);`echo bad`&|<>*?[]{}!~$HOME\\\"",
-        "/tmp/\u{65e5}\u{672c}\u{8a9e}",
+        "/tmp/$(touch bad);`echo bad`&|<>*?[]{}!~#^=$HOME\\\"",
+        "/tmp/\u{65e5}\u{672c}\u{8a9e}-v1.2_x+y@z%,:",
     ]
     .map(PathBuf::from);
     assert_eq!(
         quote_paths(&paths).unwrap(),
-        "'/tmp/a b' '/tmp/it'\\''s' '/tmp/$(touch bad);`echo bad`&|<>*?[]{}!~$HOME\\\"' '/tmp/\u{65e5}\u{672c}\u{8a9e}'"
+        "/Users/me/Screenshot.png /tmp/a\\ b /tmp/it\\'s \
+         /tmp/\\$\\(touch\\ bad\\)\\;\\`echo\\ bad\\`\\&\\|\\<\\>\\*\\?\\[\\]\\{\\}\\!\\~\\#\\^\\=\\$HOME\\\\\\\" \
+         /tmp/\u{65e5}\u{672c}\u{8a9e}-v1.2_x+y@z%\\,\\:"
     );
 }
 
@@ -33,7 +38,7 @@ fn rejects_control_characters_atomically_and_redacts_paths() {
             PathBuf::from(format!("/private{control}path")),
         ])
         .unwrap_err();
-        assert!(matches!(error, Error::FileDropControl));
+        assert!(matches!(error, crate::Error::FileDrop(Error::Control)));
         assert!(!format!("{error} {error:?}").contains("private"));
     }
 }
@@ -43,24 +48,23 @@ fn bounds_path_count_and_expanded_utf8_bytes() {
     assert!(quote_paths(&vec![PathBuf::from("x"); MAX_PATHS]).is_ok());
     assert!(matches!(
         quote_paths(&vec![PathBuf::from("x"); MAX_PATHS + 1]),
-        Err(Error::FileDropSize)
+        Err(crate::Error::FileDrop(Error::Size))
     ));
-    let text = "x".repeat(MAX_PASTE_BYTES - 2);
+    let text = "x".repeat(MAX_PASTE_BYTES);
     assert_eq!(quote_paths(&[text.into()]).unwrap().len(), MAX_PASTE_BYTES);
     for text in [
-        "x".repeat(MAX_PASTE_BYTES - 1),
-        "'".repeat(MAX_PASTE_BYTES / 4),
-        "\u{e9}".repeat(MAX_PASTE_BYTES / 2),
         "x".repeat(MAX_PASTE_BYTES + 1),
+        "'".repeat(MAX_PASTE_BYTES / 2 + 1),
+        "\u{e9}".repeat(MAX_PASTE_BYTES / 2 + 1),
     ] {
         assert!(matches!(
             quote_paths(&[text.into()]),
-            Err(Error::FileDropSize)
+            Err(crate::Error::FileDrop(Error::Size))
         ));
     }
     assert!(matches!(
-        quote_paths(&["x".repeat(MAX_PASTE_BYTES - 4).into(), "y".into()]),
-        Err(Error::FileDropSize)
+        quote_paths(&["x".repeat(MAX_PASTE_BYTES - 1).into(), "y".into()]),
+        Err(crate::Error::FileDrop(Error::Size))
     ));
 }
 
@@ -69,7 +73,7 @@ fn empty_drop_is_no_text_but_empty_path_is_invalid() {
     assert_eq!(quote_paths(&[]).unwrap(), "");
     assert!(matches!(
         quote_paths(&[PathBuf::new()]),
-        Err(Error::FileDropEmptyPath)
+        Err(crate::Error::FileDrop(Error::EmptyPath))
     ));
 }
 
@@ -79,7 +83,7 @@ fn rejects_non_utf8_instead_of_lossy_replacement() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
     let path = PathBuf::from(OsString::from_vec(b"/private/\xff".to_vec()));
     let error = quote_paths(&[path]).unwrap_err();
-    assert!(matches!(error, Error::FileDropEncoding));
+    assert!(matches!(error, crate::Error::FileDrop(Error::Encoding)));
     assert!(!format!("{error} {error:?}").contains("private"));
 }
 

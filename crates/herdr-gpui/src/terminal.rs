@@ -3,10 +3,13 @@ mod links;
 mod selection;
 pub(crate) mod splits;
 pub(crate) use accessibility::Transcript;
-pub(crate) use links::{PaneLink, RowLink, RowTarget, link_at, pane_hyperlink_at, pane_link_at};
+pub(crate) use links::{
+    ExternalUrl, PaneLink, RowLink, RowTarget, escape_into, escaped_len, file_target, link_at,
+    pane_hyperlink_at, pane_link_at,
+};
 pub(crate) use selection::{MAX_SELECTION_BYTES, Selection};
 
-use crate::config::Theme;
+use crate::{config::Theme, keymap::PaneKey};
 use gpui::{
     Bounds, KeyDownEvent, Keystroke, Modifiers, Pixels, Point, ScrollDelta, ScrollWheelEvent,
     TouchPhase, point, px, size,
@@ -16,6 +19,7 @@ use herdr_client::protocol::{
     ClientMousePosition, ClientPaneInputEvent, ClientSurfaceSize, CursorState, FrameData,
     PaneSurfaceFrame, PaneSurfacePane, SurfaceRect,
 };
+use std::num::NonZeroU16;
 
 #[cfg(test)]
 pub const BACKGROUND: u32 = 0x101419;
@@ -144,6 +148,14 @@ pub(crate) fn pane_at(
         .map(|pane| pane.pane_id.as_str())
 }
 
+/// Lines GPUI already reports for one discrete wheel notch. Linux and FreeBSD
+/// use GPUI's fixed three; Windows applies the system wheel setting, assumed
+/// at its default of three; macOS reports about one, with acceleration.
+#[cfg(target_os = "macos")]
+pub(crate) const PLATFORM_NOTCH_LINES: u16 = 1;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PLATFORM_NOTCH_LINES: u16 = 3;
+
 /// Whole wheel steps on each axis, signed as GPUI reports them: positive
 /// lines scroll up and positive columns scroll left.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -192,6 +204,7 @@ impl WheelAccumulator {
         event: &ScrollWheelEvent,
         cell_width: f32,
         cell_height: f32,
+        notch_lines: NonZeroU16,
     ) -> WheelSteps {
         if self.target.as_ref() != Some(&target.target)
             || matches!(event.touch_phase, TouchPhase::Started)
@@ -202,14 +215,14 @@ impl WheelAccumulator {
             };
         }
         // Dominance compares the reported motion itself: cells are not square.
-        let (raw_x, raw_y, x, y) = match event.delta {
+        let (raw_x, raw_y, x) = match event.delta {
             ScrollDelta::Pixels(delta) => {
-                let (x, y) = (delta.x.to_f64() as f32, delta.y.to_f64() as f32);
-                (x, y, x / cell_width, y / cell_height)
+                let x = delta.x.to_f64() as f32;
+                (x, delta.y.to_f64() as f32, x / cell_width)
             }
-            ScrollDelta::Lines(delta) => (delta.x, delta.y, delta.x, delta.y),
+            ScrollDelta::Lines(delta) => (delta.x, delta.y, delta.x),
         };
-        let lines = self.lines.add(y);
+        let lines = self.lines.add(wheel_rows(event, cell_height, notch_lines));
         // Herdr turns a horizontal wheel only into a mouse report, so motion
         // over a pane that does not report the mouse would do nothing. A
         // mostly vertical swipe's sideways drift is not a column either.
@@ -231,11 +244,21 @@ impl WheelAccumulator {
     }
 }
 
-/// The rows `event` scrolls, up into history being positive.
-pub(crate) fn wheel_rows(event: &ScrollWheelEvent, cell_height: f32) -> f32 {
+/// The rows `event` scrolls, up into history being positive. A discrete wheel
+/// notch scrolls `notch_lines`, Herdr's `ui.mouse_scroll_lines`, on both the
+/// smooth and whole-line paths; precise (trackpad) pixel motion keeps
+/// following the pointer one cell height per row.
+pub(crate) fn wheel_rows(
+    event: &ScrollWheelEvent,
+    cell_height: f32,
+    notch_lines: NonZeroU16,
+) -> f32 {
     match event.delta {
         ScrollDelta::Pixels(delta) => delta.y.to_f64() as f32 / cell_height,
-        ScrollDelta::Lines(delta) => delta.y,
+        // Multiply before dividing so the common equal counts stay exact.
+        ScrollDelta::Lines(delta) => {
+            delta.y * f32::from(notch_lines.get()) / f32::from(PLATFORM_NOTCH_LINES)
+        }
     }
 }
 
@@ -243,15 +266,22 @@ pub(crate) fn wheel_rows(event: &ScrollWheelEvent, cell_height: f32) -> f32 {
 pub struct WheelTarget {
     pub target: InputTarget,
     pub(crate) mouse_reporting: bool,
+    /// Whether the wheel goes to an application, as mouse reports or as the
+    /// alternate screen's arrow keys, rather than to the scrollback. Herdr
+    /// sends such an application one report per event whatever its count, so
+    /// a count must travel as that many events.
+    stepwise: bool,
     pub(crate) bounds: Bounds<Pixels>,
     position: ClientMousePosition,
     geometry: Option<ClientMouseGeometry>,
 }
 
 impl WheelTarget {
-    /// One event per moving axis, vertical first. Like a terminal wheel event,
-    /// each carries its whole count; Herdr reports one wheel button for it to
-    /// a mouse-reporting application and scrolls host scrollback by the count.
+    /// The events for `steps`, vertical first. Scrollback gets one event per
+    /// moving axis carrying its whole count, which Herdr scrolls by. An
+    /// application reading the wheel gets one single-step event per step,
+    /// since Herdr turns each event into exactly one report or key for it, as
+    /// a terminal sends one report per wheel step.
     pub fn wheel_events(
         &self,
         steps: WheelSteps,
@@ -276,13 +306,29 @@ impl WheelTarget {
         vertical
             .into_iter()
             .chain(horizontal)
-            .map(move |(kind, count)| {
-                let mut event = self.mouse_event(kind, modifiers);
-                if let ClientPaneInputEvent::Mouse { lines, .. } = &mut event {
-                    *lines = count.unsigned_abs();
-                }
-                event
+            .flat_map(move |(kind, count)| {
+                let count = count.unsigned_abs();
+                let (events, each) = if self.stepwise {
+                    (count, 1)
+                } else {
+                    (1, count)
+                };
+                (0..events).map(move |_| {
+                    let mut event = self.mouse_event(kind, modifiers);
+                    if let ClientPaneInputEvent::Mouse { lines, .. } = &mut event {
+                        *lines = each;
+                    }
+                    event
+                })
             })
+    }
+
+    /// The cell under the pointer, also for an application that asked for pixels.
+    pub(crate) fn cell(&self) -> (u16, u16) {
+        match self.position {
+            ClientMousePosition::Cell { column, row }
+            | ClientMousePosition::Pixels { column, row, .. } => (column, row),
+        }
     }
 
     pub(crate) fn mouse_event(
@@ -385,9 +431,16 @@ pub fn wheel_target(
     } else {
         ClientMousePosition::Cell { column, row }
     };
+    // A popup does not say whether it is on the alternate screen.
+    let stepwise = mouse_reporting
+        || matches!(&target, InputTarget::Pane(id) if surface
+            .panes
+            .iter()
+            .any(|pane| &pane.pane_id == id && pane.alternate_screen_active));
     Some(WheelTarget {
         target,
         mouse_reporting,
+        stepwise,
         bounds: Bounds::new(
             point(px(origin_x), px(origin_y)),
             size(
@@ -410,6 +463,12 @@ pub fn color(value: u32, default: u32, theme: &Theme) -> u32 {
         2 => value & 0xffffff,
         _ => default,
     }
+}
+
+/// Whether `cell` shows the theme's own background rather than a color its
+/// program chose, even one equal to it.
+pub(crate) fn on_default_background(cell: &CellData) -> bool {
+    is_default(cell.bg) && cell.modifier & REVERSED == 0
 }
 
 fn is_default(value: u32) -> bool {
@@ -452,12 +511,30 @@ pub fn viewport(width: f32, height: f32, cell_width: f32, cell_height: f32) -> C
 // `alt_keys` claims Alt-modified characters as shortcuts instead; without it
 // macOS Option-P commits `π` and the shortcut never reaches the pane.
 pub fn key_input(event: &KeyDownEvent, alt_keys: bool) -> Option<ClientPaneInputEvent> {
+    // Windows reports AltGr as Ctrl+Alt, and GPUI marks a keystroke whose
+    // modifiers change the character it types as preferring character input.
+    // A marked Ctrl+Alt keystroke with a character is AltGr typing, as `?` on
+    // a Brazilian layout: claimed as a chord, Windows never delivers the
+    // character. The mark alone is not enough, because GPUI also sets it on
+    // every keystroke it replays after an unfinished multi-key binding.
+    let modifiers = event.keystroke.modifiers;
+    if event.prefer_character_input
+        && modifiers.control
+        && modifiers.alt
+        && event.keystroke.key_char.is_some()
+    {
+        return None;
+    }
     keystroke_input(&event.keystroke, event.is_held, alt_keys)
 }
 
-/// A `[pane_keys]` press: the pane receives `sent`, held as `event` is.
-pub fn pane_key_input(event: &KeyDownEvent, sent: &Keystroke) -> Option<ClientPaneInputEvent> {
-    keystroke_input(sent, event.is_held, true)
+/// A `[pane_keys]` press: the pane receives `sent`, a key held as `event` is
+/// or text as typing commits it.
+pub fn pane_key_input(event: &KeyDownEvent, sent: &PaneKey) -> Option<ClientPaneInputEvent> {
+    match sent {
+        PaneKey::Key(keystroke) => keystroke_input(keystroke, event.is_held, true),
+        PaneKey::Text(text) => Some(ClientPaneInputEvent::TextCommit(text.clone())),
+    }
 }
 
 /// Whether a pane can receive `keystroke` as a key event, so `[pane_keys]`

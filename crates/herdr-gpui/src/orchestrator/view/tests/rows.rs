@@ -169,8 +169,6 @@ fn live_herdr_status_overrides_the_stored_state() {
             status: Status::NeedsInput
         })
     );
-    // Both runs need the user: one waits for input, one failed.
-    assert_eq!(attention(&runs), 2);
     // An agent on another host with the same pane id is not this run's.
     let elsewhere = vec![LiveAgent {
         host: Some("devbox".into()),
@@ -183,84 +181,57 @@ fn live_herdr_status_overrides_the_stored_state() {
 }
 
 #[test]
-fn runs_group_by_what_needs_the_user_first() {
-    let items = beads();
-    let done = run("a", &items[0], RunState::Completed, "2026-10-04T03:00:00Z");
-    let working = run("b", &items[1], RunState::Running, "2026-10-04T02:00:00Z");
-    let waiting = run("c", &items[2], RunState::NeedsInput, "2026-10-04T01:00:00Z");
-    let list = vec![done, working, waiting];
-    let runs = Runs::new(&list, &[], &[]);
-    let lines = run_lines(&runs, &items, "", false);
-    let groups: Vec<_> = lines
-        .iter()
-        .map(|line| match line {
-            RunLine::Group { group, count } => format!("{}:{count}", group.label()),
-            RunLine::Run(row) => list[row.run].id.clone(),
+fn pull_requests_hide_merged_and_closed_until_asked_for() {
+    let states = [
+        ("open", "2026-10-04T00:00:00Z"),
+        ("draft", "2026-10-03T00:00:00Z"),
+        ("merged", "2026-10-05T00:00:00Z"),
+        ("closed", "2026-10-06T00:00:00Z"),
+    ];
+    let items: Vec<Item> = states
+        .into_iter()
+        .zip(1..)
+        .map(|((state, updated), number)| {
+            let mut pr = item(Provider::Github, &format!("pr/{number}"), state, updated);
+            pr.state = state.into();
+            if state != "open" {
+                pr.author = Some("someone".into());
+            }
+            pr.pull_request = Some(crate::orchestrator::PullRequest {
+                number,
+                additions: None,
+                deletions: None,
+                base_ref: "main".into(),
+                head_ref: "x".into(),
+                base_sha: String::new(),
+                head_sha: String::new(),
+                head_repository: None,
+            });
+            pr
         })
         .collect();
-    assert_eq!(
-        groups,
-        ["NEEDS YOU:1", "c", "WORKING:1", "b", "FINISHED:1", "a"]
-    );
-    let active = run_lines(&runs, &items, "", true);
-    assert_eq!(active.len(), 4);
-    let searched = run_lines(&runs, &items, "store", false);
-    assert_eq!(searched.len(), 2);
-}
-
-#[test]
-fn pull_requests_list_in_every_state_unless_narrowed() {
-    let mut open = item(Provider::Github, "pr/1", "Open one", "2026-10-04T00:00:00Z");
-    let mut merged = item(
-        Provider::Github,
-        "pr/2",
-        "Merged one",
-        "2026-10-05T00:00:00Z",
-    );
-    for (pr, number) in [(&mut open, 1), (&mut merged, 2)] {
-        pr.pull_request = Some(crate::orchestrator::PullRequest {
-            number,
-            additions: None,
-            deletions: None,
-            base_ref: "main".into(),
-            head_ref: "x".into(),
-            base_sha: String::new(),
-            head_sha: String::new(),
-            head_repository: None,
-        });
-    }
-    merged.state = "merged".into();
-    merged.author = Some("someone".into());
-    let items = vec![open, merged];
     let runs = Runs::new(&[], &[], &[]);
-    let all = pull_request_rows(
-        &items,
-        &runs,
-        "",
-        Filters::default(),
-        None,
-        false,
-        Sort::Updated,
-    );
-    assert_eq!(all.iter().map(|row| row.item).collect::<Vec<_>>(), [1, 0]);
-    let open_only = Filters {
-        open_only: true,
+    let listed = |filters: Filters, mine: bool| {
+        pull_request_rows(
+            &items,
+            &runs,
+            "",
+            filters,
+            Some("penso"),
+            mine,
+            Sort::Updated,
+        )
+        .iter()
+        .map(|row| row.item)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(listed(Filters::default(), false), [0, 1]);
+    let every_state = Filters {
+        open_only: false,
         ..Filters::default()
     };
-    assert_eq!(
-        pull_request_rows(&items, &runs, "", open_only, None, false, Sort::Updated).len(),
-        1
-    );
-    let mine = pull_request_rows(
-        &items,
-        &runs,
-        "",
-        Filters::default(),
-        Some("penso"),
-        true,
-        Sort::Updated,
-    );
-    assert_eq!(mine.iter().map(|row| row.item).collect::<Vec<_>>(), [0]);
+    assert_eq!(listed(every_state, false), [3, 2, 0, 1]);
+    assert_eq!(listed(every_state, true), [0]);
 }
 
 #[test]

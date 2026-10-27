@@ -9,7 +9,7 @@ use crate::{
     limits::{COMMAND_CAPACITY, EVENT_CAPACITY},
     options::{ConnectOptions, validate_options},
     queue,
-    session::{Signals, run_connection},
+    session::{Pace, Signals, run_connection},
     ssh::{self, Bridge},
     transport::Stream,
     wsl,
@@ -131,6 +131,7 @@ pub fn connect_with_connector<T: Into<Transport>>(
                     Signals {
                         stop: &worker_stop,
                         liveness: &worker_liveness,
+                        pace: Pace::default(),
                     },
                 )
                 // The child guard is dropped before delivering a disconnect event.
@@ -147,7 +148,7 @@ pub fn connect_with_connector<T: Into<Transport>>(
                     let _ = deliver(&tx, ClientEvent::VersionMismatch(mismatch), &worker_stop);
                 }
                 let ssh = match &result {
-                    Err(Error::SshRefused(failure)) => Some(*failure),
+                    Err(Error::Ssh(ssh::Error::Refused(failure))) => Some(*failure),
                     _ => None,
                 };
                 let reason = result

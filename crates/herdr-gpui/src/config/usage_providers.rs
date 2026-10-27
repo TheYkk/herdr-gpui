@@ -30,7 +30,7 @@ pub(super) fn hide_providers(
                 Some(item) => {
                     let array = item.as_array().ok_or(Error::InvalidHideProviders)?;
                     if array.iter().any(|id| id.as_str().is_none()) {
-                        return Err(Error::InvalidHideProviders);
+                        return Err(Error::InvalidHideProviders.into());
                     }
                     Some(array)
                 }

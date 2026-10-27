@@ -14,7 +14,6 @@ use crate::{
 };
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, Instant},
 };
 
@@ -50,16 +49,16 @@ fn git_directory(checkout: &Path, deadline: Instant) -> crate::Result<PathBuf> {
         .to_str()
         .filter(|path| Path::new(path).is_absolute())
     else {
-        return Err(Error::PrAbsolutePath);
+        return Err(herdr_github::pull_request::Error::AbsolutePath.into());
     };
-    let mut command = Command::new("git");
+    let mut command = herdr_client::new_command("git");
     command
         .args(["-c", "core.fsmonitor=false", "-C", checkout])
         .args(["rev-parse", "--absolute-git-dir"]);
     let (ok, output) = run(&mut command, deadline, &|| false)?;
     let path = PathBuf::from(output.trim_end_matches(['\r', '\n']));
     if !ok || !path.is_absolute() {
-        return Err(Error::PrCheckout);
+        return Err(herdr_github::pull_request::Error::Checkout.into());
     }
     Ok(path)
 }
@@ -95,7 +94,7 @@ fn markdown(item: &Item, origin: &Origin) -> String {
     // an agent will read. Nothing here is an instruction to follow.
     format!(
         "# Task context\n\n\
-         This checkout was created by Herdr GPUI for a GitHub {what}.\n\n\
+         This checkout was created by Herdr UI for a GitHub {what}.\n\n\
          - Repository: {repository}\n\
          - {label}: #{number}\n\
          - Title: {title}\n\

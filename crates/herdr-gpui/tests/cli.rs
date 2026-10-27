@@ -1,11 +1,24 @@
 //! Informational and usage-error paths must not reach GPUI or require a desktop/daemon.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
+
+#[cfg(target_os = "macos")]
+#[path = "cli/clipboard.rs"]
+mod clipboard;
 
 use std::{
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    sync::Once,
     thread,
     time::{Duration, Instant},
 };
+
+/// How long one command may take once the executable has started before.
+const COMMAND_LIMIT: Duration = Duration::from_secs(10);
+/// The first launch of a fresh build waits for the system to check it and,
+/// for an Intel build on an Apple silicon runner, for Rosetta to translate
+/// it; that cost belongs to no test's command.
+const FIRST_LAUNCH_LIMIT: Duration = Duration::from_secs(120);
+static FIRST_LAUNCH: Once = Once::new();
 
 fn cli(args: &[&str]) -> Output {
     cli_in(args, None)
@@ -14,6 +27,7 @@ fn cli(args: &[&str]) -> Output {
 /// Runs with `state` as the only state directory, and without the variables
 /// a Herdr pane would set, so no running app or daemon is ever reached.
 fn cli_in(args: &[&str], state: Option<&std::path::Path>) -> Output {
+    warm_up();
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-gpui"));
     if let Some(state) = state {
         command
@@ -23,14 +37,32 @@ fn cli_in(args: &[&str], state: Option<&std::path::Path>) -> Output {
             .env_remove("HERDR_WORKSPACE_ID")
             .env_remove("HERDR_PANE_ID");
     }
-    let mut child = command
+    let child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("launch the Cargo-built GUI binary");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    wait(child, args, COMMAND_LIMIT)
+}
+
+/// Launches the executable once, so later deadlines time only commands.
+fn warm_up() {
+    FIRST_LAUNCH.call_once(|| {
+        let child = Command::new(env!("CARGO_BIN_EXE_herdr-gpui"))
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch the Cargo-built GUI binary");
+        wait(child, &["--help"], FIRST_LAUNCH_LIMIT);
+    });
+}
+
+fn wait(mut child: Child, args: &[&str], limit: Duration) -> Output {
+    let deadline = Instant::now() + limit;
     loop {
         if child.try_wait().unwrap().is_some() {
             return child.wait_with_output().unwrap();
@@ -165,7 +197,7 @@ fn browser_commands_answer_without_a_window() {
     assert!(output.status.success(), "{output:?}");
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("browser open URL"), "{help}");
-    assert!(help.contains("3 Herdr GPUI not running"), "{help}");
+    assert!(help.contains("3 Herdr UI not running"), "{help}");
 
     let output = cli(&["browser", "skill"]);
     assert!(output.status.success(), "{output:?}");
@@ -215,15 +247,11 @@ fn browser_open_reports_a_missing_app_and_a_refused_address() {
         "{output:?}"
     );
     let output = cli_in(&["browser", "open", "localhost:3000"], Some(state.path()));
-    if cfg!(unix) {
-        assert_eq!(output.status.code(), Some(3), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("not running"),
-            "{output:?}"
-        );
-    } else {
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
-    }
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not running"),
+        "{output:?}"
+    );
     assert!(output.stdout.is_empty(), "{output:?}");
 }
 
@@ -252,8 +280,7 @@ fn local_pages_and_feedback_need_the_app_and_a_plain_folder() {
 
     // A plain file is accepted and only the missing app stops it.
     let output = cli_in(&["browser", "open", page], Some(state.path()));
-    let expected = if cfg!(unix) { 3 } else { 1 };
-    assert_eq!(output.status.code(), Some(expected), "{output:?}");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
 
     // A file in a hidden folder is never served.
     let output = cli_in(
@@ -272,5 +299,73 @@ fn local_pages_and_feedback_need_the_app_and_a_plain_folder() {
     usage_error(
         &["browser", "feedback", "--wait", "soon"],
         "--wait requires a number of seconds",
+    );
+}
+
+#[test]
+fn control_commands_list_and_explain_themselves_without_the_app() {
+    let output = cli(&["--help"]);
+    let help = String::from_utf8(output.stdout).unwrap();
+    for family in ["status", "window", "checkpoint", "events", "diagnostics"] {
+        assert!(help.contains(&format!("  {family} ")), "{family}: {help}");
+    }
+    let output = cli(&["notes", "--help"]);
+    assert!(output.status.success(), "{output:?}");
+    let usage = String::from_utf8(output.stdout).unwrap();
+    assert!(usage.contains("herdr-gpui notes set TEXT"), "{usage}");
+    assert!(usage.contains("Exit status:"), "{usage}");
+    let output = cli(&["commands", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let commands: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        commands
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["name"] == "toggle_sidebar"),
+        "{commands}"
+    );
+    usage_error(&["window", "size", "huge"], "Invalid WIDTHxHEIGHT");
+    usage_error(&["app"], "app requires focus|hide|quit");
+    usage_error(&["tab", "focus", "x"], "Invalid ID");
+}
+
+#[test]
+fn control_commands_report_a_missing_app_by_status_and_in_json() {
+    let parent = if cfg!(unix) {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let state = tempfile::Builder::new()
+        .prefix("hgc")
+        .tempdir_in(parent)
+        .unwrap();
+    // The state directory names a socket, or on Windows a pipe, of its own.
+    let (status, code, message) = (3, "not_running", "Herdr UI is not running");
+    let output = cli_in(&["status"], Some(state.path()));
+    assert_eq!(output.status.code(), Some(status), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(message), "{stderr}");
+    let output = cli_in(&["window", "list", "--json"], Some(state.path()));
+    assert_eq!(output.status.code(), Some(status), "{output:?}");
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], code, "{error}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn usage_errors_of_a_json_command_are_json() {
+    let output = cli(&["tab", "focus", "x", "--json"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "usage", "{error}");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid ID"),
+        "{error}"
     );
 }

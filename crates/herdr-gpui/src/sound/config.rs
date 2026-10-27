@@ -147,7 +147,7 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load() -> Result<Self> {
-        Self::load_path(&config_path(|key| std::env::var_os(key)))
+        Self::load_path(&config_path(herdr_client::local_var))
     }
 
     fn load_path(path: &Path) -> Result<Self> {
@@ -163,7 +163,7 @@ impl Settings {
             .read_to_string(&mut text)
             .map_err(|error| Error::from(error).at_path(path))?;
         if text.len() > 1_048_576 {
-            return Err(Error::SoundConfigSize.at_path(path));
+            return Err(Error::Sound(crate::sound::Error::ConfigSize).at_path(path));
         }
         Self::parse(&text, path).map_err(|error| error.at_path(path))
     }

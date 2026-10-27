@@ -62,7 +62,10 @@ impl SettingsWindow {
         true
     }
 
-    pub(super) fn render_usage_provider_controls(&self, cx: &mut Context<Self>) -> Div {
+    pub(in crate::settings_window) fn render_usage_provider_controls(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let config = &self.config.usage;
         let on = config.show;
         let interactive = on && !self.busy();

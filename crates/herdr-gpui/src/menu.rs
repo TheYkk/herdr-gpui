@@ -3,14 +3,22 @@
 //! popup while one is open, and every modal action is fenced by the connection
 //! it was started under.
 
+mod appear;
 mod checkpoints;
 mod chrome;
+#[cfg(feature = "cloud")]
+mod cloud_create;
+#[cfg(feature = "cloud")]
+mod cloud_destroy;
 mod colors;
-mod devices;
+pub(crate) mod devices;
 mod fan_out;
 mod git;
 mod github;
+mod open_checkout;
+mod open_link;
 mod page;
+mod page_title;
 mod pr;
 mod pr_actions;
 mod sessions;
@@ -27,6 +35,7 @@ mod workspace_close;
 mod worktree_note;
 mod worktree_open;
 mod worktree_render;
+mod worktree_shortcut;
 mod worktree_source;
 
 #[cfg(test)]
@@ -44,19 +53,33 @@ mod worktree_open_tests;
 #[cfg(test)]
 mod worktree_tests;
 
+#[cfg(any(windows, test, feature = "integration-test"))]
 pub(crate) use state::Cover;
 pub(crate) use {
     colors::{accent, danger, online, teleported, tint},
     page::{Page, WorkspaceAction},
     state::{MenuState, Removal},
     version_mismatch::Notice as VersionNotice,
+    worktree_shortcut::WorktreeShortcut,
     worktree_source::WorktreeSource,
 };
 
-pub(crate) use devices::enter as enter_key;
+pub(crate) use devices::{DeviceScope, SettingsHint, enter as enter_key};
 use page::WorkspaceMenuAction;
 use state::Submission;
 use workspace::WorkspaceTarget;
+
+/// A build without cloud providers never asks to create or destroy one.
+#[cfg(not(feature = "cloud"))]
+impl crate::HerdrWindow {
+    fn cloud_batch_open(&self) -> bool {
+        false
+    }
+
+    fn cloud_batch_page(&self, _: &mut gpui::Context<Self>) -> Option<gpui::Div> {
+        None
+    }
+}
 
 /// Shared trailing action geometry for pickers and workspace context menus.
 fn action_icon(
@@ -92,7 +115,7 @@ const MENU_MARGIN: f32 = 8.;
 
 /// Daemon failures arrive as an open envelope. Keep the code so callers can
 /// classify the refusal, and the message for display.
-fn endpoint_error(error: &serde_json::Value) -> (&str, &str) {
+pub(crate) fn endpoint_error(error: &serde_json::Value) -> (&str, &str) {
     (
         error["code"].as_str().unwrap_or("endpoint_error"),
         error["message"].as_str().unwrap_or("Invalid daemon error"),

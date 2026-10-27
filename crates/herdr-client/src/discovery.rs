@@ -6,7 +6,42 @@ use std::{
     env,
     ffi::OsString,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
+
+static LOGIN_CONFIG_HOME: OnceLock<PathBuf> = OnceLock::new();
+
+/// Sets, once per process, the `XDG_CONFIG_HOME` of the user's login shell,
+/// for a process whose own environment has none. An application opened from
+/// Finder or a desktop launcher inherits the session's environment rather
+/// than the shell's, while a daemon started from that shell keeps its sockets
+/// under the shell's root. Only an absolute path is kept: a relative one
+/// would resolve against this process's directory, not the shell's. Returns
+/// `false` when it is refused or one was already set, which is kept.
+pub fn set_login_config_home(path: PathBuf) -> bool {
+    path.is_absolute() && LOGIN_CONFIG_HOME.set(path).is_ok()
+}
+
+/// A variable of this process's environment for resolving local paths. An
+/// unset `XDG_CONFIG_HOME` falls back to [`set_login_config_home`]'s, so the
+/// sockets, and an application's settings beside them, are where the daemon
+/// keeps them.
+pub fn local_var(name: &str) -> Option<OsString> {
+    with_login_config_home(name, |name| env::var_os(name), LOGIN_CONFIG_HOME.get())
+}
+
+fn with_login_config_home(
+    name: &str,
+    var: impl Fn(&str) -> Option<OsString>,
+    login: Option<&PathBuf>,
+) -> Option<OsString> {
+    var(name).or_else(|| {
+        (name == "XDG_CONFIG_HOME")
+            .then_some(login)
+            .flatten()
+            .map(Into::into)
+    })
+}
 
 /// Upstream's configuration root, before the `herdr`/`herdr-dev` directory.
 /// Windows has no XDG layout by default, so upstream falls back to `%APPDATA%`
@@ -36,10 +71,22 @@ fn config_root(var: &impl Fn(&str) -> Option<OsString>) -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudProvider {
+    #[cfg(feature = "azure")]
+    Azure,
+    #[cfg(feature = "boat")]
+    Boat,
     #[cfg(feature = "coder")]
     Coder,
+    #[cfg(feature = "container")]
+    Container,
     #[cfg(feature = "daytona")]
     Daytona,
+    #[cfg(feature = "opensandbox")]
+    OpenSandbox,
+    #[cfg(feature = "railway")]
+    Railway,
+    #[cfg(feature = "sprites")]
+    Sprites,
 }
 
 #[cfg(feature = "cloud")]
@@ -50,15 +97,39 @@ impl CloudProvider {
         Self::Coder,
         #[cfg(feature = "daytona")]
         Self::Daytona,
+        #[cfg(feature = "railway")]
+        Self::Railway,
+        #[cfg(feature = "boat")]
+        Self::Boat,
+        #[cfg(feature = "azure")]
+        Self::Azure,
+        #[cfg(feature = "container")]
+        Self::Container,
+        #[cfg(feature = "sprites")]
+        Self::Sprites,
+        #[cfg(feature = "opensandbox")]
+        Self::OpenSandbox,
     ];
 
     /// The stable key used in saved files and endpoint IDs.
     pub fn key(self) -> &'static str {
         match self {
+            #[cfg(feature = "azure")]
+            Self::Azure => "azure",
+            #[cfg(feature = "boat")]
+            Self::Boat => "boat",
             #[cfg(feature = "coder")]
             Self::Coder => "coder",
+            #[cfg(feature = "container")]
+            Self::Container => "container",
             #[cfg(feature = "daytona")]
             Self::Daytona => "daytona",
+            #[cfg(feature = "opensandbox")]
+            Self::OpenSandbox => "opensandbox",
+            #[cfg(feature = "railway")]
+            Self::Railway => "railway",
+            #[cfg(feature = "sprites")]
+            Self::Sprites => "sprites",
         }
     }
 }
@@ -77,9 +148,10 @@ pub enum ConnectTarget {
     /// A machine a cloud provider created, reached through the application's
     /// connector, which holds the provider's credential and builds the command
     /// that runs the bridge there. `account` names the provider account or
-    /// deployment; `id` is the provider's stable ID for the machine, which the
-    /// connector reaches it by, and `machine` its name when it was saved, for
-    /// display: a machine can be renamed, or deleted and its name reused.
+    /// deployment (for Railway, the path of the SSH key); `id` is the
+    /// provider's stable ID for the machine, which the connector reaches it by,
+    /// and `machine` its name when it was saved, for display: a machine can be
+    /// renamed, or deleted and its name reused.
     #[cfg(feature = "cloud")]
     Cloud {
         provider: CloudProvider,
@@ -110,7 +182,7 @@ fn app_dir(development: bool) -> &'static str {
 
 /// The directory a release or development installation keeps its sessions in.
 pub(crate) fn config_dir(development: bool) -> PathBuf {
-    config_root(&|name| env::var_os(name)).join(app_dir(development))
+    config_root(&local_var).join(app_dir(development))
 }
 
 pub fn session_socket(config_dir: &Path, name: &str) -> Result<PathBuf> {
@@ -149,13 +221,13 @@ impl ConnectTarget {
     }
 
     pub fn socket_path(&self) -> Result<PathBuf> {
-        self.socket_path_with(|name| env::var_os(name))
+        self.socket_path_with(local_var)
     }
 
     /// Standard session endpoint, ignoring socket overrides (including `Socket`).
     /// This identifies a user-configured local location, not a daemon executable.
     pub fn local_session_socket_path(&self) -> Result<PathBuf> {
-        self.local_session_socket_path_with(|name| env::var_os(name))
+        self.local_session_socket_path_with(local_var)
     }
 
     fn local_session_socket_path_with(

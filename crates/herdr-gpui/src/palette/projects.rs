@@ -1,6 +1,7 @@
 //! Local project discovery and path validation run only on background workers.
 
-use crate::{Error, Result};
+use super::Error;
+use crate::Result;
 use herdr_client::protocol::ClientShellSnapshot;
 use std::{
     collections::HashSet,
@@ -25,7 +26,7 @@ pub(super) struct Project {
 #[derive(Default)]
 pub(super) struct Collection {
     pub(super) projects: Vec<Project>,
-    pub(super) errors: Vec<Error>,
+    pub(super) errors: Vec<crate::Error>,
 }
 
 pub(super) struct Cancellation(pub(super) Arc<AtomicBool>);
@@ -47,7 +48,7 @@ fn valid_path(path: &Path) -> Result<&str> {
         .filter(|text| {
             path.is_absolute() && text.len() <= 8192 && !text.chars().any(char::is_control)
         })
-        .ok_or(Error::PaletteProjectPath)
+        .ok_or(Error::ProjectPath.into())
 }
 
 /// Expand variables as path data, never as shell syntax. An unset variable is
@@ -60,14 +61,14 @@ fn expand(
     let mut expanded = OsString::new();
     let mut rest = root;
     if rest == "~" || rest.starts_with("~/") {
-        expanded.push(home.ok_or(Error::MissingHome)?);
+        expanded.push(home.ok_or(crate::Error::MissingHome)?);
         rest = &rest[1..];
     }
     while let Some(index) = rest.find('$') {
         expanded.push(&rest[..index]);
         rest = &rest[index + 1..];
         let (name, consumed) = if let Some(braced) = rest.strip_prefix('{') {
-            let end = braced.find('}').ok_or(Error::PaletteProjectPath)?;
+            let end = braced.find('}').ok_or(Error::ProjectPath)?;
             (&braced[..end], end + 2)
         } else {
             let end = rest
@@ -80,12 +81,12 @@ fn expand(
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
         {
-            return Err(Error::PaletteProjectPath);
+            return Err(Error::ProjectPath.into());
         }
         expanded.push(
             get(name)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| Error::PaletteProjectVariable(name.into()))?,
+                .ok_or_else(|| Error::ProjectVariable(name.into()))?,
         );
         rest = &rest[consumed..];
     }
@@ -116,17 +117,22 @@ pub(super) fn collect(roots: &[String], cancelled: &AtomicBool) -> Collection {
         }
         let result = (|| -> Result<()> {
             let root = expand(root, |name| std::env::var_os(name), home.as_deref())?;
-            let root =
-                fs::canonicalize(&root).map_err(|error| Error::from(error).at_path(&root))?;
-            for entry in fs::read_dir(&root).map_err(|error| Error::from(error).at_path(&root))? {
+            // Children are listed under the verbatim root and each brought
+            // to plain form on its own: a short root can hold a child too
+            // long for the plain form, which `validate` keeps verbatim.
+            let root = fs::canonicalize(&root)
+                .map_err(|error| crate::Error::from(error).at_path(&root))?;
+            for entry in
+                fs::read_dir(&root).map_err(|error| crate::Error::from(error).at_path(&root))?
+            {
                 if cancelled.load(Ordering::Relaxed) {
                     break;
                 }
                 visits += 1;
                 if visits > MAX_VISITS || collection.projects.len() >= MAX_PROJECTS {
-                    return Err(Error::PaletteProjectLimit);
+                    return Err(Error::ProjectLimit.into());
                 }
-                let entry = entry.map_err(|error| Error::from(error).at_path(&root))?;
+                let entry = entry.map_err(|error| crate::Error::from(error).at_path(&root))?;
                 let name = entry.file_name();
                 let Some(label) = name.to_str().filter(|name| !name.starts_with('.')) else {
                     continue;
@@ -135,12 +141,12 @@ pub(super) fn collect(roots: &[String], cancelled: &AtomicBool) -> Collection {
                 // but discovery never escapes them through a child link.
                 if !entry
                     .file_type()
-                    .map_err(|error| Error::from(error).at_path(&entry.path()))?
+                    .map_err(|error| crate::Error::from(error).at_path(&entry.path()))?
                     .is_dir()
                 {
                     continue;
                 }
-                let path = entry.path();
+                let path = super::canonical::plain_form(entry.path());
                 valid_path(&path)?;
                 if seen.insert(path.clone()) {
                     collection.projects.push(Project {
@@ -152,7 +158,7 @@ pub(super) fn collect(roots: &[String], cancelled: &AtomicBool) -> Collection {
             Ok(())
         })();
         if let Err(error) = result {
-            let limited = matches!(error, Error::PaletteProjectLimit);
+            let limited = matches!(error, crate::Error::Palette(Error::ProjectLimit));
             collection.errors.push(error);
             if limited {
                 break;
@@ -167,10 +173,10 @@ pub(super) fn collect(roots: &[String], cancelled: &AtomicBool) -> Collection {
 
 pub(super) fn validate(project: &Project) -> Result<()> {
     valid_path(&project.path)?;
-    let path = fs::canonicalize(&project.path)
-        .map_err(|error| Error::from(error).at_path(&project.path))?;
+    let path = super::canonical::canonicalize(&project.path)
+        .map_err(|error| crate::Error::from(error).at_path(&project.path))?;
     if path != project.path || !path.is_dir() {
-        return Err(Error::PaletteProjectRemoved);
+        return Err(Error::ProjectRemoved.into());
     }
     Ok(())
 }
@@ -183,7 +189,7 @@ pub(super) fn workspace_for_path(snapshot: &ClientShellSnapshot, path: &Path) ->
         .into_iter()
         .find_map(|(workspace, cwd)| {
             let cwd = Path::new(&cwd);
-            (cwd.is_absolute() && fs::canonicalize(cwd).is_ok_and(|cwd| cwd == path))
+            (cwd.is_absolute() && super::canonical::canonicalize(cwd).is_ok_and(|cwd| cwd == path))
                 .then_some(workspace)
         })
 }
@@ -249,11 +255,11 @@ mod tests {
         );
         assert!(matches!(
             expand("$MISSING/work", get, None),
-            Err(Error::PaletteProjectVariable(_))
+            Err(crate::Error::Palette(Error::ProjectVariable(_)))
         ));
         assert!(matches!(
             expand("relative", get, None),
-            Err(Error::PaletteProjectPath)
+            Err(crate::Error::Palette(Error::ProjectPath))
         ));
         assert!(expand("${ROOT", get, None).is_err());
         assert!(expand("$(touch x)", get, None).is_err());
@@ -283,6 +289,34 @@ mod tests {
         Ok(())
     }
 
+    /// A root short enough for a plain path can hold children that are not:
+    /// one too long for it, and one whose name ends in a dot. Discovery lists
+    /// both in the form `validate` computes, so neither reads as removed.
+    #[cfg(windows)]
+    #[test]
+    fn discovered_children_validate_when_only_the_root_is_plain() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let long = "a".repeat(255);
+        let verbatim = fs::canonicalize(root.path())?;
+        fs::create_dir(verbatim.join(&long))?;
+        fs::create_dir(verbatim.join("dot."))?;
+        let result = collect(
+            &[root.path().to_string_lossy().into_owned()],
+            &AtomicBool::new(false),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.projects.len(), 2);
+        for project in &result.projects {
+            assert!(
+                project.path.to_string_lossy().starts_with(r"\\?\"),
+                "{}",
+                project.path.display()
+            );
+            validate(project)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn limits_filesystem_work() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
@@ -296,7 +330,7 @@ mod tests {
         assert_eq!(result.projects.len(), MAX_PROJECTS);
         assert!(matches!(
             result.errors.as_slice(),
-            [Error::PaletteProjectLimit]
+            [crate::Error::Palette(Error::ProjectLimit)]
         ));
         Ok(())
     }
@@ -304,7 +338,7 @@ mod tests {
     #[test]
     fn matches_only_the_root_panes_launch_directory() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let path = fs::canonicalize(root.path())?;
+        let path = super::super::canonical::canonicalize(root.path())?;
         let nested = path.join("nested");
         fs::create_dir(&nested)?;
         let mut snapshot: ClientShellSnapshot = serde_json::from_str(include_str!(
@@ -339,7 +373,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), &path)?;
         assert!(matches!(
             validate(&result.projects[0]),
-            Err(Error::PaletteProjectRemoved)
+            Err(crate::Error::Palette(Error::ProjectRemoved))
         ));
         Ok(())
     }

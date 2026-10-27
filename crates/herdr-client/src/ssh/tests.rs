@@ -1,11 +1,17 @@
 use super::*;
 
+#[cfg(unix)]
 mod command;
+#[cfg(unix)]
+mod config_dir;
 mod forward;
 mod incompatible;
 mod probe_failure;
 mod windows_host;
+#[cfg(windows)]
+mod windows_pipes;
 
+#[cfg(unix)]
 #[test]
 fn discovery_and_bridge_stdio_work_with_quoted_install_paths() {
     let root =
@@ -82,6 +88,7 @@ fn probe_classifies_only_finished_output() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn probe_script_reports_the_session_server_without_starting_it() {
     let root = std::env::temp_dir().join(format!("herdr-probe-{}-a ' b", std::process::id()));
@@ -109,6 +116,7 @@ esac
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn origin_command_reads_only_the_named_repository() {
     let root = std::env::temp_dir().join(format!("herdr-origin-{}-a ' $(b)", std::process::id()));
@@ -159,7 +167,7 @@ fn origin_lookup_rejects_relative_or_control_git_dirs_before_ssh() {
     for dir in ["relative/.git", "/repo\n/.git", ""] {
         assert!(matches!(
             remote_origin_url("host", dir, Duration::from_secs(1), || false),
-            Err(Error::InvalidGitDir)
+            Err(crate::Error::InvalidGitDir)
         ));
     }
     assert!(matches!(
@@ -169,8 +177,19 @@ fn origin_lookup_rejects_relative_or_control_git_dirs_before_ssh() {
             Duration::from_secs(1),
             || false
         ),
-        Err(Error::InvalidSshTarget)
+        Err(crate::Error::Ssh(Error::InvalidTarget))
     ));
+}
+
+/// Runs the real `ssh -G`, trying again when a busy machine times it out.
+fn resolve_with_retries(target: &str) -> Destination {
+    for _ in 1..3 {
+        match resolve_destination(target) {
+            Err(crate::Error::Ssh(Error::Timeout)) => continue,
+            result => return result.unwrap(),
+        }
+    }
+    resolve_destination(target).unwrap()
 }
 
 #[test]
@@ -190,12 +209,12 @@ fn destinations_come_from_the_resolved_config_not_the_spelling() {
     assert_eq!(parse_destination(b"user a\nhostnamex b\nport 22\n"), None);
     assert_eq!(parse_destination(b"user a\nhostname b\nport x\n"), None);
     // Spellings of one host agree through the real `ssh -G`.
-    let a = resolve_destination("penso@example.invalid").unwrap();
-    let b = resolve_destination("ssh://penso@EXAMPLE.invalid:22").unwrap();
+    let a = resolve_with_retries("penso@example.invalid");
+    let b = resolve_with_retries("ssh://penso@EXAMPLE.invalid:22");
     assert_eq!(a, b);
     assert!(matches!(
         resolve_destination("-oProxyCommand=x"),
-        Err(Error::InvalidSshTarget)
+        Err(crate::Error::Ssh(Error::InvalidTarget))
     ));
 }
 
@@ -203,11 +222,11 @@ fn destinations_come_from_the_resolved_config_not_the_spelling() {
 fn probe_rejects_bad_targets_before_spawning_ssh() {
     assert!(matches!(
         probe_host("-oProxyCommand=x", "default"),
-        Err(Error::InvalidSshTarget)
+        Err(crate::Error::Ssh(Error::InvalidTarget))
     ));
     assert!(matches!(
         probe_host("host", "../escape"),
-        Err(Error::InvalidSession)
+        Err(crate::Error::InvalidSession)
     ));
 }
 
@@ -222,12 +241,19 @@ fn command_is_noninteractive_and_target_is_one_argument() {
     ] {
         assert!(args.contains(&option));
     }
-    // The user's SSH config decides agent forwarding and which master to share.
-    assert!(
-        !args
-            .iter()
-            .any(|arg| arg.starts_with("ForwardAgent=") || arg.starts_with("ControlPath="))
-    );
+    // The user's SSH config decides agent forwarding and, on Unix, which
+    // master to share. Windows OpenSSH cannot share one, and a configured
+    // `ControlPath` would fail every connection there.
+    assert!(!args.iter().any(|arg| arg.starts_with("ForwardAgent=")));
+    let control_paths: Vec<_> = args
+        .iter()
+        .filter(|arg| arg.starts_with("ControlPath="))
+        .collect();
+    if cfg!(windows) {
+        assert_eq!(control_paths, [&"ControlPath=none"]);
+    } else {
+        assert!(control_paths.is_empty());
+    }
     assert_eq!(args[args.len() - 3], "--");
     assert_eq!(args[args.len() - 2], "user@host;not-a-command");
     assert_eq!(quote("a'b"), "'a'\\''b'");
@@ -249,7 +275,7 @@ fn script_runs_under_remote_sh_and_rejects_option_targets() {
     assert_eq!(args[args.len() - 1], "/bin/sh -c 'echo '\\''hi'\\'''");
     assert!(matches!(
         script_command("-oProxyCommand=bad", "true"),
-        Err(Error::InvalidSshTarget)
+        Err(crate::Error::Ssh(Error::InvalidTarget))
     ));
 }
 #[test]
@@ -330,13 +356,13 @@ fn banner_output_is_bounded_and_a_closed_stream_is_reported() {
     let mut flood = scripted(bytes(&b"x".repeat(16385)));
     assert!(matches!(
         await_ready(&mut flood, &AtomicBool::new(false), Instant::now()),
-        Err(Error::SshOutputLimit)
+        Err(crate::Error::Ssh(Error::OutputLimit))
     ));
     // An exhausted script reads zero bytes, as a closed pipe does.
     let mut closed = scripted(bytes(b"partial\n"));
     assert!(matches!(
         await_ready(&mut closed, &AtomicBool::new(false), Instant::now()),
-        Err(Error::SshClosed)
+        Err(crate::Error::Ssh(Error::Closed))
     ));
 }
 
@@ -346,13 +372,13 @@ fn cancellation_and_deadline_are_checked_before_reading() {
     let mut never_read = scripted(vec![Err(io::Error::other("must not be read"))]);
     assert!(matches!(
         await_ready(&mut never_read, &stop, Instant::now()),
-        Err(Error::SshCancelled)
+        Err(crate::Error::Ssh(Error::Cancelled))
     ));
     let expired = Instant::now() - Duration::from_secs(16);
     let mut also_never_read = scripted(vec![Err(io::Error::other("must not be read"))]);
     assert!(matches!(
         await_ready(&mut also_never_read, &AtomicBool::new(false), expired),
-        Err(Error::SshTimeout)
+        Err(crate::Error::Ssh(Error::Timeout))
     ));
 }
 
@@ -376,6 +402,6 @@ fn retryable_read_errors_do_not_end_the_banner() {
     let mut fatal = scripted(vec![Err(io::Error::other("broken pipe"))]);
     assert!(matches!(
         await_ready(&mut fatal, &AtomicBool::new(false), Instant::now()),
-        Err(Error::Io(_))
+        Err(crate::Error::Io(_))
     ));
 }

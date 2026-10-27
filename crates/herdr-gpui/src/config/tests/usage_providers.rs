@@ -135,11 +135,14 @@ fn malformed_usage_tables_are_rejected_and_left_untouched() -> anyhow::Result<()
         )
         .err()
         .context("malformed usage settings must be rejected")?;
-        let Error::Path { source, .. } = &error else {
+        let crate::Error::Path { source, .. } = &error else {
             anyhow::bail!("expected a path-scoped settings error: {error:?}");
         };
+        let crate::Error::Settings(source) = source.as_ref() else {
+            anyhow::bail!("expected a settings error: {source:?}");
+        };
         assert_eq!(
-            std::mem::discriminant(source.as_ref()),
+            std::mem::discriminant(source),
             std::mem::discriminant(&expected)
         );
         assert_eq!(fs::read_to_string(&path)?, original);

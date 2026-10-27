@@ -1,26 +1,44 @@
 //! The sidebar's device footer and the device picker that scopes the sidebar
-//! to one device or opens the Add Device dialog. Device scope is presentation
+//! to one device, several, or all of them, or opens the Add Device dialog. Device scope is presentation
 //! state; connection ownership stays in `endpoint`.
 mod activity_card;
 mod add_device;
+#[cfg(feature = "cloud")]
+mod catalog;
 #[cfg(feature = "coder")]
 pub(super) mod coder;
 pub(crate) use add_device::enter;
 mod discover;
+mod error;
+mod host_key;
 mod host_menu;
+mod local_network;
+pub(super) mod rail;
+mod saved_warning;
+mod scope;
 mod setup;
 mod wsl;
 
 pub(super) use add_device::Setup;
+pub(crate) use error::Error;
 pub(crate) use host_menu::HostMenu;
+pub(crate) use scope::DeviceScope;
 pub(super) use wsl::WslSetup;
 
 use super::{Page, colors};
 use crate::{Command, HerdrWindow};
 use gpui::{prelude::*, *};
 use herdr_client::ConnectTarget;
+use rail::add_device_offer;
 
 pub(super) const MENU_GAP: f32 = 12.;
+
+/// How the picker says several devices can be listed at once.
+const MULTI_SELECT_HINT: &str = if cfg!(target_os = "macos") {
+    "⌘-click or Space for several"
+} else {
+    "Ctrl-click or Space for several"
+};
 pub(super) const MENU_WIDTH: f32 = 280.;
 
 /// How tall an anchored list above the sidebar footer may be, measured from the
@@ -39,15 +57,14 @@ fn device_list_height(anchor_y: Pixels) -> Pixels {
 }
 
 fn room_above(anchor_y: Pixels) -> Pixels {
-    let chrome = crate::titlebar::HEIGHT
-        + crate::worktree_banner::reserved(env!("HERDR_BUILD_WORKTREE") == "1");
+    let chrome = crate::titlebar::HEIGHT;
     anchor_y - px(chrome + MENU_GAP + super::MENU_MARGIN + 12.)
 }
 
-struct SettingsHint {
-    text: SharedString,
-    foreground: u32,
-    surface: u32,
+pub(crate) struct SettingsHint {
+    pub(crate) text: SharedString,
+    pub(crate) foreground: u32,
+    pub(crate) surface: u32,
 }
 
 impl Render for SettingsHint {
@@ -64,23 +81,24 @@ impl Render for SettingsHint {
     }
 }
 
-#[cfg(feature = "cloud")]
-fn capitalized(word: &str) -> String {
-    let mut chars = word.chars();
-    chars
-        .next()
-        .map(|first| first.to_uppercase().chain(chars).collect())
-        .unwrap_or_default()
-}
-
 impl HerdrWindow {
-    /// The cloud providers set up in the config or environment, in picker order.
+    /// The cloud providers set up in the config or environment, in rail order.
     #[cfg(feature = "cloud")]
-    fn cloud_providers(&self) -> Vec<crate::cloud::CloudProvider> {
+    pub(super) fn cloud_providers(&self) -> Vec<crate::cloud::CloudProvider> {
         self.cloud_providers_with_env(|name| std::env::var_os(name))
     }
 
     #[cfg(feature = "cloud")]
+    // Providers that need no setting never read the environment.
+    #[cfg_attr(
+        not(any(
+            feature = "azure",
+            feature = "boat",
+            feature = "coder",
+            feature = "daytona"
+        )),
+        allow(unused_variables)
+    )]
     fn cloud_providers_with_env(
         &self,
         var: impl Fn(&str) -> Option<std::ffi::OsString>,
@@ -92,6 +110,12 @@ impl HerdrWindow {
             .iter()
             .copied()
             .filter(|provider| match provider {
+                #[cfg(feature = "azure")]
+                crate::cloud::CloudProvider::Azure => self.config.azure.configured(&var),
+                #[cfg(feature = "boat")]
+                crate::cloud::CloudProvider::Boat => {
+                    self.config.boat.api_url.is_some() || var("HERDR_BOAT_API_URL").is_some()
+                }
                 #[cfg(feature = "coder")]
                 crate::cloud::CloudProvider::Coder => {
                     self.config.coder.url.is_some() || var("HERDR_CODER_URL").is_some()
@@ -100,38 +124,60 @@ impl HerdrWindow {
                 crate::cloud::CloudProvider::Daytona => {
                     self.config.daytona.api_url.is_some() || var("HERDR_DAYTONA_API_URL").is_some()
                 }
+                #[cfg(feature = "opensandbox")]
+                crate::cloud::CloudProvider::OpenSandbox => {
+                    self.config.opensandbox.api_url.is_some()
+                        || var("HERDR_OPENSANDBOX_API_URL").is_some()
+                }
+                #[cfg(feature = "sprites")]
+                crate::cloud::CloudProvider::Sprites => {
+                    self.config.sprites.api_url.is_some() || var("HERDR_SPRITES_API_URL").is_some()
+                }
+                // A local engine has no account; it is set up in Settings.
+                #[cfg(feature = "container")]
+                crate::cloud::CloudProvider::Container => false,
+                // Has no account to configure; it is set up in Settings.
+                #[cfg(feature = "railway")]
+                crate::cloud::CloudProvider::Railway => false,
             })
             .collect()
     }
 
-    /// How many rows the picker offers to add a cloud provider's machine.
-    fn cloud_provider_rows(&self) -> usize {
-        #[cfg(feature = "cloud")]
-        return self.cloud_providers().len();
-        #[cfg(not(feature = "cloud"))]
-        0
-    }
-
-    /// Whether the open page is a cloud provider's add dialog.
+    /// Whether the open page is a cloud provider's pane of Add Device.
     pub(in crate::menu) fn cloud_dialog_open(&self) -> bool {
         #[cfg(feature = "coder")]
         if self.menu.page == Some(Page::AddCoder) {
             return true;
         }
+        #[cfg(feature = "cloud")]
+        if matches!(self.menu.page, Some(Page::AddCloud(_) | Page::AddProvider)) {
+            return true;
+        }
         false
     }
 
-    /// The open cloud provider's add dialog, if one is open.
+    /// The open cloud provider's pane of Add Device, if one is open.
     pub(in crate::menu) fn render_cloud_dialog(
         &self,
+        compact: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         #[cfg(feature = "coder")]
         if self.menu.page == Some(Page::AddCoder) {
-            return Some(self.render_add_coder(cx).into_any_element());
+            return Some(self.render_add_coder(compact, cx).into_any_element());
         }
-        #[cfg(not(feature = "coder"))]
-        let _ = cx;
+        #[cfg(feature = "cloud")]
+        if self.menu.page == Some(Page::AddProvider) {
+            return Some(self.render_add_provider(compact, cx).into_any_element());
+        }
+        #[cfg(feature = "cloud")]
+        if let Some(Page::AddCloud(provider)) = self.menu.page {
+            return Some(
+                self.render_add_cloud(provider, compact, cx)
+                    .into_any_element(),
+            );
+        }
+        let _ = (compact, cx);
         None
     }
 
@@ -144,9 +190,21 @@ impl HerdrWindow {
     }
 
     pub(crate) fn device_visible(&self, id: &str) -> bool {
-        self.device_filter
-            .as_deref()
-            .is_none_or(|filter| filter == id)
+        self.device_filter.shows(id)
+    }
+
+    /// Lists `scope`'s devices in the sidebar, from the top: the rows a scroll
+    /// or reveal kept belong to the old list.
+    pub(super) fn set_device_scope(&mut self, scope: DeviceScope) {
+        self.device_filter = scope;
+        for scroll in &self.sidebar_scroll {
+            scroll.set_offset(Point::default());
+        }
+        for revealed in &self.sidebar_revealed {
+            revealed.set(None);
+        }
+        // The row a reveal left for the next frame is in the old list.
+        self.sidebar_pin_reveal.set(None);
     }
 
     pub(crate) fn device_setup_unavailable(&self) -> Option<&'static str> {
@@ -161,11 +219,28 @@ impl HerdrWindow {
         }
     }
 
-    /// Why saved SSH devices cannot be added or edited here. Windows saves WSL
-    /// distributions instead; its client has no SSH bridge.
-    pub(super) fn ssh_setup_unavailable(&self) -> Option<&'static str> {
-        self.device_setup_unavailable()
-            .or_else(|| cfg!(windows).then_some("Saved SSH devices are unavailable on Windows."))
+    /// Whether the sidebar draws the device footer, per `[sidebar]
+    /// device_footer`.
+    pub(crate) fn device_footer_shown(&self) -> bool {
+        self.config
+            .sidebar_style
+            .device_footer
+            .shown(self.endpoints.len(), self.cloud_jobs_pending())
+    }
+
+    /// Where the Sessions list opens while the footer is hidden: the sidebar's
+    /// bottom-left corner, where the footer's button would sit.
+    pub(crate) fn render_sessions_anchor(&self) -> impl IntoElement {
+        let anchor = self.sessions_anchor.clone();
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, _, _| {
+                anchor.set(point(bounds.left() + px(8.), bounds.bottom()));
+            },
+        )
+        .absolute()
+        .inset_0()
+        .size_full()
     }
 
     pub(crate) fn render_device_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -186,14 +261,29 @@ impl HerdrWindow {
             .into();
         let foreground = self.theme.foreground;
         let surface = self.theme.surface;
-        let label = self
-            .device_filter
-            .as_ref()
-            .and_then(|id| self.endpoints.iter().find(|endpoint| &endpoint.id == id))
-            .map_or("All Devices", |endpoint| endpoint.label.as_str());
+        let picked = self.device_filter.picked().count();
+        let label = match self.device_filter.picked().next() {
+            Some(id) if picked == 1 => self
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == id)
+                .map_or_else(|| "All Devices".to_owned(), |e| e.label.clone()),
+            Some(_) => format!("{picked} Devices"),
+            None => "All Devices".to_owned(),
+        };
         let connected = self.endpoints.iter().any(|endpoint| {
             self.device_visible(&endpoint.id) && endpoint.live.status.is_connected()
         });
+        // Beside the activity bar, which carries Settings, the picker leads
+        // with the device's initials and says how many hosts there are.
+        let bar = self.activity_bar_shown();
+        let hosts = self.endpoints.len();
+        let initials: String = label
+            .split_whitespace()
+            .filter_map(|word| word.chars().next())
+            .take(2)
+            .flat_map(char::to_uppercase)
+            .collect();
         div()
             .id("device-footer")
             .debug_selector(|| "device-footer".into())
@@ -208,6 +298,18 @@ impl HerdrWindow {
             .child(
                 div()
                     .id("device-picker")
+                    .role(Role::Button)
+                    .aria_label(format!(
+                        "Devices: {label}, {}",
+                        if connected {
+                            "connected"
+                        } else {
+                            "disconnected"
+                        }
+                    ))
+                    .map(|picker| {
+                        self.chrome_stop(crate::window::chrome_focus::Region::Sidebar, picker)
+                    })
                     .relative()
                     .debug_selector(|| "device-picker".into())
                     .flex_1()
@@ -223,12 +325,30 @@ impl HerdrWindow {
                         div()
                             .relative()
                             .flex_none()
-                            .child(
-                                svg()
-                                    .path("icons/devices.svg")
-                                    .size(px(16.))
-                                    .text_color(rgb(self.theme.foreground)),
-                            )
+                            .map(|icon| {
+                                if bar {
+                                    icon.child(
+                                        div()
+                                            .debug_selector(|| "device-footer-initials".into())
+                                            .size(px(22.))
+                                            .rounded_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .bg(rgb(self.theme.active))
+                                            .text_size(px(10.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(initials),
+                                    )
+                                } else {
+                                    icon.child(
+                                        svg()
+                                            .path("icons/devices.svg")
+                                            .size(px(16.))
+                                            .text_color(rgb(self.theme.foreground)),
+                                    )
+                                }
+                            })
                             // How many Coder workspaces are still being added,
                             // on the icon's corner so the label keeps its room.
                             .when(self.cloud_jobs_pending() > 0, |icon| {
@@ -253,6 +373,15 @@ impl HerdrWindow {
                             }),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(label.to_owned()))
+                    .when(bar && hosts > 1, |picker| {
+                        picker.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(rgb(self.theme.muted))
+                                .child(format!("{hosts} hosts")),
+                        )
+                    })
                     .child(
                         div()
                             .size(px(6.))
@@ -295,6 +424,11 @@ impl HerdrWindow {
             .child(
                 div()
                     .id("device-sessions")
+                    .role(Role::Button)
+                    .aria_label("Sessions")
+                    .map(|button| {
+                        self.chrome_stop(crate::window::chrome_focus::Region::Sidebar, button)
+                    })
                     .relative()
                     .debug_selector(|| "device-sessions".into())
                     .size(px(28.))
@@ -334,36 +468,38 @@ impl HerdrWindow {
                         this.open_sessions(this.sessions_anchor.get(), window, cx);
                     })),
             )
-            .child(
-                div()
-                    .id("device-settings")
-                    .debug_selector(|| "device-settings".into())
-                    .size(px(28.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(crate::config::corners::CONTROL))
-                    .cursor_pointer()
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| SettingsHint {
-                            text: hint.clone(),
-                            foreground,
-                            surface,
+            .when(!bar, |footer| {
+                footer.child(
+                    div()
+                        .id("device-settings")
+                        .debug_selector(|| "device-settings".into())
+                        .size(px(28.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(crate::config::corners::CONTROL))
+                        .cursor_pointer()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| SettingsHint {
+                                text: hint.clone(),
+                                foreground,
+                                surface,
+                            })
+                            .into()
                         })
-                        .into()
-                    })
-                    .hover(|s| s.bg(rgb(self.theme.active)))
-                    .child(
-                        svg()
-                            .path("icons/settings.svg")
-                            .size(px(18.))
-                            .text_color(rgb(self.theme.foreground)),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.command(Command::Settings, window, cx);
-                    })),
-            )
+                        .hover(|s| s.bg(rgb(self.theme.active)))
+                        .child(
+                            svg()
+                                .path("icons/settings.svg")
+                                .size(px(18.))
+                                .text_color(rgb(self.theme.foreground)),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.command(Command::Settings, window, cx);
+                        })),
+                )
+            })
     }
 
     pub(super) fn render_devices(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -379,7 +515,7 @@ impl HerdrWindow {
                 "{count} {} · {connected} connected",
                 if count == 1 { "device" } else { "devices" }
             ),
-            self.device_filter.is_none(),
+            self.device_filter == DeviceScope::All,
             true,
         )];
         rows.extend(self.endpoints.iter().map(|endpoint| {
@@ -400,34 +536,18 @@ impl HerdrWindow {
             (
                 endpoint.label.clone(),
                 format!("{detail} · {}", endpoint.status()),
-                self.device_filter.as_ref() == Some(&endpoint.id),
+                self.device_filter.picks(&endpoint.id),
                 endpoint.enabled,
             )
         }));
         rows.push((
             "Add Device…".into(),
             self.device_setup_unavailable()
-                .unwrap_or(if cfg!(windows) {
-                    "Attach to Herdr in a WSL distribution"
-                } else {
-                    "Set up a remote host over SSH"
-                })
+                .unwrap_or_else(|| add_device_offer(self.cloud_offered()))
                 .into(),
             false,
             self.device_setup_unavailable().is_none(),
         ));
-        #[cfg(feature = "cloud")]
-        for provider in self.cloud_providers() {
-            let (name, noun) = (crate::cloud::name(provider), crate::cloud::noun(provider));
-            rows.push((
-                format!("Add {name} {}…", capitalized(noun)),
-                self.device_setup_unavailable()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| crate::cloud::offer(provider).to_owned()),
-                false,
-                self.device_setup_unavailable().is_none(),
-            ));
-        }
         let mut view = div()
             .id("devices-list")
             .max_h(device_list_height(self.menu.anchor.y))
@@ -439,8 +559,19 @@ impl HerdrWindow {
             .child(
                 div()
                     .p(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
                     .text_color(rgb(self.theme.muted))
-                    .child("DEVICES"),
+                    .child(div().flex_none().child("DEVICES"))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(self.config.ui.size * 0.85))
+                            .child(MULTI_SELECT_HINT),
+                    ),
             );
         for (index, (label, detail, checked, enabled)) in rows.into_iter().enumerate() {
             let endpoint = index.checked_sub(1).and_then(|i| self.endpoints.get(i));
@@ -540,8 +671,12 @@ impl HerdrWindow {
                             cx.notify();
                         }
                     }))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.choose_device(index, window, cx);
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.modifiers().secondary() {
+                            this.toggle_listed_device(index, window, cx);
+                        } else {
+                            this.choose_device(index, window, cx);
+                        }
                     })),
             );
         }
@@ -616,38 +751,35 @@ impl HerdrWindow {
             return;
         }
         tracing::info!(category = "device_setup", "Opening Add Device");
-        if cfg!(windows) {
-            self.open_add_wsl(window, cx);
-        } else {
-            self.open_add_device(window, cx);
-        }
+        self.open_add_device(window, cx);
         cx.notify();
     }
 
+    /// Opens Settings > Cloud devices on `provider`'s tab.
+    #[cfg(feature = "cloud")]
+    pub(super) fn open_provider_settings(
+        &mut self,
+        provider: crate::cloud::CloudProvider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_menu(window, cx);
+        #[cfg(not(test))]
+        crate::settings_window::open_cloud(cx.weak_entity(), Some(provider), cx);
+        #[cfg(test)]
+        {
+            self.menu.settings_opened = Some(provider);
+        }
+    }
+
     fn choose_device(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(offset) = index.checked_sub(self.endpoints.len() + 2) {
-            #[cfg(feature = "cloud")]
-            if self.device_setup_unavailable().is_none()
-                && let Some(provider) = self.cloud_providers().into_iter().nth(offset)
-            {
-                match provider {
-                    #[cfg(feature = "coder")]
-                    crate::cloud::CloudProvider::Coder => self.open_coder_setup(window, cx),
-                    #[cfg(feature = "daytona")]
-                    crate::cloud::CloudProvider::Daytona => {
-                        self.dismiss_menu(window, cx);
-                        crate::settings_window::open_cloud(cx.weak_entity(), provider, cx);
-                    }
-                }
-            }
-            #[cfg(not(feature = "cloud"))]
-            let _ = offset;
+        if index > self.endpoints.len() + 1 {
             return;
         }
         if index == self.endpoints.len() + 1 {
             self.open_device_setup(window, cx);
         } else {
-            let filter = if index == 0 {
+            let id = if index == 0 {
                 None
             } else {
                 let Some(endpoint) = self.endpoints.get(index - 1).filter(|e| e.enabled) else {
@@ -656,21 +788,57 @@ impl HerdrWindow {
                 Some(endpoint.id.clone())
             };
             self.dismiss_menu(window, cx);
-            if let Some(id) = &filter
+            if let Some(id) = &id
                 && !self.select_endpoint(id, cx)
             {
                 return;
             }
-            self.device_filter = filter;
-            for scroll in &self.sidebar_scroll {
-                scroll.set_offset(Point::default());
-            }
-            for revealed in &self.sidebar_revealed {
-                revealed.set(None);
-            }
-            // The row a reveal left for the next frame is in the old list.
-            self.sidebar_pin_reveal.set(None);
+            self.set_device_scope(id.map_or(DeviceScope::All, DeviceScope::only));
         }
+        cx.notify();
+    }
+
+    /// Adds a device to the sidebar's list or takes it away, leaving the picker
+    /// open to pick more. Taking away the device on screen selects the first
+    /// one still listed, so the terminal always belongs to a listed device;
+    /// like any switch of device, that closes the picker.
+    fn toggle_listed_device(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // All Devices and Add Device have nothing to add.
+        let Some(endpoint) = index
+            .checked_sub(1)
+            .and_then(|index| self.endpoints.get(index))
+        else {
+            return self.choose_device(index, window, cx);
+        };
+        if !endpoint.enabled {
+            return;
+        }
+        let enabled = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.enabled)
+            .map(|endpoint| endpoint.id.as_str());
+        let Some(scope) = self.device_filter.toggled(
+            &endpoint.id,
+            &self.endpoints[self.selected_endpoint].id,
+            enabled,
+        ) else {
+            return;
+        };
+        if !scope.shows(&self.endpoints[self.selected_endpoint].id) {
+            let Some(next) = self
+                .displayed_devices()
+                .into_iter()
+                .find(|(_, endpoint)| endpoint.enabled && scope.shows(&endpoint.id))
+                .map(|(_, endpoint)| endpoint.id.clone())
+            else {
+                return;
+            };
+            if !self.select_endpoint(&next, cx) {
+                return;
+            }
+        }
+        self.set_device_scope(scope);
         cx.notify();
     }
 
@@ -686,7 +854,7 @@ impl HerdrWindow {
             }
         } else {
             let key = event.keystroke.key.as_str();
-            let count = self.endpoints.len() + 2 + self.cloud_provider_rows();
+            let count = self.endpoints.len() + 2;
             match key {
                 "up" | "down" => {
                     let index = self.menu.selected.unwrap_or(0).min(count - 1);
@@ -698,6 +866,7 @@ impl HerdrWindow {
                     cx.notify();
                 }
                 "enter" => self.choose_device(self.menu.selected.unwrap_or(0), window, cx),
+                "space" => self.toggle_listed_device(self.menu.selected.unwrap_or(0), window, cx),
                 "escape" => self.dismiss_menu(window, cx),
                 _ => {}
             }

@@ -29,10 +29,11 @@ pub(super) fn muted() -> bool {
 pub(super) fn play(
     sound: Sound,
     custom: Option<&Path>,
+    volume: u8,
     cancel: &[&AtomicBool],
     stop: &AtomicBool,
 ) -> Result<()> {
-    if muted() {
+    if muted() || volume == 0 {
         return Ok(());
     }
     let deadline = Instant::now() + MAX_DURATION;
@@ -51,6 +52,7 @@ pub(super) fn play(
     output.log_on_drop(false);
     check(deadline, cancel, stop, Instant::now())?;
     let player = Player::connect_new(output.mixer());
+    player.set_volume(gain(volume));
     player.append(source.take_duration(MAX_DURATION));
     wait(
         &player,
@@ -63,6 +65,14 @@ pub(super) fn play(
             std::thread::sleep(Duration::from_millis(25));
         },
     )
+}
+
+/// The amplitude factor for a volume percent. Loudness follows amplitude
+/// roughly as its square, so a linear factor would leave the lower half of
+/// the range barely quieter than full: 50% plays at a quarter, about -12 dB.
+fn gain(percent: u8) -> f32 {
+    let level = f32::from(percent.min(crate::config::SoundConfig::MAX_VOLUME)) / 100.;
+    level * level
 }
 
 fn decode(sound: Sound, custom: Option<&Path>) -> Result<SoundDecoder> {
@@ -89,20 +99,20 @@ fn decode_file(path: &Path) -> Result<SoundDecoder> {
         let file = options.open(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-            return Err(Error::SoundFileSize);
+            return Err(Error::Sound(crate::sound::Error::FileSize));
         }
         let mut bytes = Vec::new();
         file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_FILE_BYTES {
-            return Err(Error::SoundFileSize);
+            return Err(Error::Sound(crate::sound::Error::FileSize));
         }
         Ok(bytes)
     };
     let bytes = read().map_err(|error| match error {
-        Error::Io(source) => Error::SoundFile {
+        Error::Io(source) => Error::Sound(crate::sound::Error::File {
             path: path.into(),
             source,
-        },
+        }),
         error => error,
     })?;
     Ok(Decoder::try_from(Cursor::new(Cow::Owned(bytes)))?)
@@ -110,10 +120,10 @@ fn decode_file(path: &Path) -> Result<SoundDecoder> {
 
 fn check(deadline: Instant, cancel: &[&AtomicBool], stop: &AtomicBool, now: Instant) -> Result<()> {
     if cancel.iter().any(|flag| flag.load(Ordering::Acquire)) || stop.load(Ordering::Acquire) {
-        return Err(Error::SoundCancelled);
+        return Err(Error::Sound(crate::sound::Error::Cancelled));
     }
     if now >= deadline {
-        return Err(Error::SoundTimeout);
+        return Err(Error::Sound(crate::sound::Error::Timeout));
     }
     Ok(())
 }
@@ -132,7 +142,7 @@ fn wait(
             break Err(error);
         }
         if let Ok(error) = errors.try_recv() {
-            break Err(Error::SoundStream(error));
+            break Err(Error::Sound(crate::sound::Error::Stream(error)));
         }
         if player.empty() {
             break Ok(());

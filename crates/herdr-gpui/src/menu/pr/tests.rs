@@ -287,7 +287,7 @@ fn live_local_pr_lookup() {
         return;
     }
     let mut auth = crate::github::Auth::default();
-    auth.initialize(&crate::config::Config::default());
+    auth.initialize(&Default::default());
     let deadline = Instant::now() + Duration::from_secs(45);
     while auth.loading_profile() && Instant::now() < deadline {
         auth.poll();
@@ -297,11 +297,22 @@ fn live_local_pr_lookup() {
         .profile
         .as_ref()
         .expect("existing GitHub sign-in unavailable");
+    let mut cache = crate::pull_request::Cache::default();
+    cache.scope(
+        (0, 0, "live".into()),
+        profile.token.clone(),
+        &profile.login,
+        Origin::Local,
+    );
+    cache.refresh(input.clone(), Instant::now());
     let mut lookup = crate::pull_request::Lookup::default();
-    lookup.request(input, Origin::Local, profile.token.clone());
     let deadline = Instant::now() + Duration::from_secs(20);
-    while lookup.loading && Instant::now() < deadline {
-        lookup.poll();
+    loop {
+        cache.poll(Instant::now());
+        cache.present(&input, &mut lookup, Instant::now());
+        if !lookup.loading || Instant::now() >= deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(!lookup.loading, "PR worker deadline");
@@ -337,12 +348,16 @@ fn snapshot_metadata_is_the_lookup_key_and_leaves_checkout_to_git() {
     assert_eq!(input.branch, "feature");
     assert!(matches!(
         repository_input(None, Some("feature")),
-        Err(crate::Error::PrMetadata)
+        Err(herdr_github::Error::PullRequest(
+            herdr_github::pull_request::Error::Metadata
+        ))
     ));
     for branch in [None, Some(""), Some("bad\nbranch")] {
         assert!(matches!(
             repository_input(Some(&tree), branch),
-            Err(crate::Error::PrBranch)
+            Err(herdr_github::Error::PullRequest(
+                herdr_github::pull_request::Error::Branch
+            ))
         ));
     }
     let relative = ClientShellWorktree {
@@ -351,6 +366,8 @@ fn snapshot_metadata_is_the_lookup_key_and_leaves_checkout_to_git() {
     };
     assert!(matches!(
         repository_input(Some(&relative), Some("feature")),
-        Err(crate::Error::PrAbsolutePath)
+        Err(herdr_github::Error::PullRequest(
+            herdr_github::pull_request::Error::AbsolutePath
+        ))
     ));
 }

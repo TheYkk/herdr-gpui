@@ -17,10 +17,13 @@ fn draw(cx: &mut VisualTestContext) {
     cx.update(|window, cx| full_draw(window, cx).clear(cx));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
+mod bar;
+mod config_change;
+#[cfg(any(target_os = "linux", windows))]
 mod dragging;
-#[cfg(target_os = "linux")]
-mod linux;
 mod navigation;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod resizing;
+#[cfg(any(target_os = "linux", windows))]
+mod shortcut_labels;

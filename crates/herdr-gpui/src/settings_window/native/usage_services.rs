@@ -152,11 +152,7 @@ pub(super) async fn verify(
                 let Some(entry) = view.usage.current() else {
                     return Ok(false);
                 };
-                let shown = entry.headline(
-                    &view.config.usage,
-                    crate::usage::HEADLINE,
-                    view.usage.chosen(),
-                );
+                let shown = entry.headline(&view.config.usage, view.usage.chosen());
                 let claude_shown = shown
                     .iter()
                     .any(|reading| reading.provider.id() == "claude");

@@ -4,6 +4,34 @@ use core::prelude::v1::test;
 use gpui::VisualTestContext;
 use std::sync::Arc;
 
+// Moves run POSIX host scripts and are never offered on other clients.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod moves;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[gpui::test]
+fn tab_moves_are_not_offered_on_unsupported_platforms(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        crate::bind_keys(cx);
+        let mut view = crate::sidebar::layout_tests::fixture_window(window, cx);
+        let snapshot: ClientShellSnapshot = serde_json::from_str(include_str!(
+            "../../../herdr-protocol/tests/fixtures/endpoint-snapshot-v1.json"
+        ))
+        .unwrap();
+        view.live.snapshot = Some(Arc::new(snapshot));
+        view.endpoints[0].connection.target = herdr_client::ConnectTarget::Local;
+        view
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_tab_menu("w1:t1", None, Point::default(), window, cx);
+            let tab = v.menu.tab.as_ref().unwrap();
+            assert!(!tab.movable);
+            assert!(!tab.actions().contains(&Action::MoveToWorkspace));
+        })
+    });
+}
+
 #[test]
 fn tab_target_retains_membership_and_rejects_stale_snapshots() {
     let original: ClientShellSnapshot = serde_json::from_str(include_str!(
@@ -168,7 +196,7 @@ fn inactive_tab_menu_rename_composition_cancel_and_fences(cx: &mut TestAppContex
                     view.selection_epoch += 1;
                 }
                 assert!(!view.menu_target_current());
-                for (action, _) in ACTIONS {
+                for action in ACTIONS {
                     view.activate_tab_menu(action, window, cx);
                     assert!(view.menu.page == Some(Page::Tab));
                     assert!(view.menu.tab.as_ref().unwrap().error.is_some());
@@ -238,7 +266,7 @@ fn close_tab_confirms_closing_that_tab_in_herdr(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn close_tab_in_a_split_lets_only_its_group_go(cx: &mut TestAppContext) {
+fn close_tab_in_a_split_confirms_closing_that_tab_in_herdr(cx: &mut TestAppContext) {
     let (view, cx) = group_window(cx);
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -246,31 +274,22 @@ fn close_tab_in_a_split_lets_only_its_group_go(cx: &mut TestAppContext) {
         })
     });
     draw(cx);
-    let [left, right] = view.read_with(cx, |view, _| {
-        view.group_slots()
-            .into_iter()
-            .map(|slot| slot.id)
-            .collect::<Vec<_>>()
-    })[..] else {
-        panic!("two groups")
-    };
-    let tabs = |view: &Entity<HerdrWindow>, cx: &mut VisualTestContext, group| {
-        cx.update(|_, cx| view.read(cx).group_tabs(group, cx))
-    };
-    choose(cx, "g1-tab-t1", "tab-menu-2");
-    // No confirmation and nothing for Herdr: the tab left one strip.
-    view.read_with(cx, |view, _| {
-        assert!(view.menu.page.is_none() && view.menu.close.is_none());
-        assert_eq!(view.live.snapshot.as_ref().unwrap().tabs.len(), 2);
-    });
-    assert!(!tabs(&view, cx, right).contains(&Pick::Herdr("t1".into())));
-    assert!(tabs(&view, cx, left).contains(&Pick::Herdr("t1".into())));
-
+    let left = view.read_with(cx, |view, _| view.group_slots()[0].id);
     // New Tab opens in the group whose strip asked for it.
-    choose(cx, "g1-tab-t0", "tab-menu-0");
+    choose(cx, "tab-t0", "tab-menu-0");
     view.read_with(cx, |view, _| {
         assert!(view.menu.page.is_none());
-        assert_eq!(view.expected_new_tab_group(), Some(right));
+        assert_eq!(view.expected_new_tab_group(), Some(left));
+    });
+    // Close is the tab's own close, as without a split.
+    choose(cx, "tab-t1", "tab-menu-2");
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.menu.page, Some(Page::ConfirmClose));
+        let snapshot = view.live.snapshot.as_ref().unwrap();
+        assert_eq!(
+            view.menu.close,
+            crate::close_modal::CloseConfirmation::capture_tab(snapshot, "t1")
+        );
     });
 }
 

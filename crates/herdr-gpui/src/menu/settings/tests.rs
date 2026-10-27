@@ -146,7 +146,7 @@ fn notification_reload_retimes_pending_clears_disabled_and_keeps_failed_settings
                 config.notifications.position =
                     herdr_client::protocol::ToastHerdrPosition::TopRight;
                 config.terminal.size = 18.;
-                config.layout.sidebar_gap = 16.;
+                config.terminal_padding.x = crate::config::Sides::new(16., 16.).unwrap();
                 config.layout.mode =
                     crate::config::LayoutMode::from(crate::config::Density::Compact);
                 let theme = config.theme(false)?;
@@ -161,7 +161,7 @@ fn notification_reload_retimes_pending_clears_disabled_and_keeps_failed_settings
         assert_eq!(view.config.notifications.delay_seconds, 0);
         assert_eq!(view.config.terminal.size, 18.);
         assert_eq!(view.configured_terminal_size, 18.);
-        assert_eq!(view.config.layout.sidebar_gap, 16.);
+        assert_eq!(view.config.terminal_padding.x.start(), 16.);
         assert_eq!(
             view.config.layout.mode,
             crate::config::LayoutMode::from(crate::config::Density::Compact)
@@ -175,7 +175,7 @@ fn notification_reload_retimes_pending_clears_disabled_and_keeps_failed_settings
         assert!(view.endpoints[0].toasts.entries[0].1.visible);
         assert_eq!(view.config.terminal.size, 20.);
         assert_eq!(view.configured_terminal_size, 18.);
-        assert_eq!(view.config.layout.sidebar_gap, 16.);
+        assert_eq!(view.config.terminal_padding.x.start(), 16.);
         assert_eq!(
             view.config.layout.mode,
             crate::config::LayoutMode::from(crate::config::Density::Compact)
@@ -221,7 +221,10 @@ fn config_reload_toggles_tab_flags_and_preserves_them_on_failure(cx: &mut gpui::
             assert!(view.config_load.is_none());
             assert!(view.local_error.is_none());
         });
-        for error in [crate::Error::MissingHome, crate::Error::EmptyTheme] {
+        for error in [
+            crate::Error::MissingHome,
+            crate::config::Error::EmptyTheme.into(),
+        ] {
             view.update(cx, |view, cx| {
                 view.load_gui_config_with(move || Err(error), cx);
             });
@@ -253,7 +256,7 @@ fn failed_config_load_still_restores_the_saved_github_sign_in(cx: &mut gpui::Tes
         assert!(view.menu.github.loading_profile());
         assert_eq!(
             view.menu.github.store(),
-            crate::github::Store::select(&view.config)
+            crate::github::select_store(&view.config.github)
         );
     });
 }
@@ -283,7 +286,7 @@ fn config_load_is_coherent_bounded_and_cancellable(cx: &mut gpui::TestAppContext
         assert_eq!(view.theme, view.config.theme(false).unwrap());
         assert!(view.config_load.is_none());
         assert_eq!(view.config_load_revision, 1);
-        view.load_gui_config_with(|| Err(crate::Error::EmptyTheme), cx);
+        view.load_gui_config_with(|| Err(crate::config::Error::EmptyTheme.into()), cx);
     });
     cx.run_until_parked();
     cx.update(|window, cx| {
@@ -413,13 +416,12 @@ fn config_reload_rebinds_the_keymap(cx: &mut gpui::TestAppContext) {
     cx.update(|_, cx| {
         let keymap = cx.key_bindings();
         let keymap = keymap.borrow();
-        let console =
-            keymap.all_bindings_for_input(&[Keystroke::parse(if cfg!(target_os = "linux") {
-                "ctrl-l"
-            } else {
-                "cmd-l"
-            })
-            .unwrap()]);
+        let level = if crate::controls::CTRL_SHORTCUTS {
+            "ctrl-l"
+        } else {
+            "cmd-l"
+        };
+        let console = keymap.all_bindings_for_input(&[Keystroke::parse(level).unwrap()]);
         assert_eq!(console.len(), 1);
     });
     view.read_with(cx, |view, _| {

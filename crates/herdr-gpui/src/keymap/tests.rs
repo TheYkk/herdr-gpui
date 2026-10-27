@@ -2,9 +2,12 @@ use super::*;
 use crate::controls::platform_default as default;
 use herdr_client::protocol::ClientShellCommand;
 
+mod custom_defaults;
 mod custom_reference;
 mod literal_plus;
+mod pane_keys;
 mod platform_defaults;
+mod shift_enter;
 
 fn overrides(entries: &[(&str, Binding)]) -> BTreeMap<String, Binding> {
     entries
@@ -111,34 +114,34 @@ fn invalid_configuration_reports_the_command() {
     let error = |entries: &[(&str, Binding)]| with(entries).unwrap_err();
     assert!(matches!(
         error(&[("new_space", one("cmd-n"))]),
-        Error::UnknownKeybinding(name) if name == "new_space"
+        crate::Error::Keymap(Error::UnknownKeybinding(name)) if name == "new_space"
     ));
     let invalid = error(&[("new_tab", one("cmd-n-t"))]);
     assert!(std::error::Error::source(&invalid).is_some());
     assert!(matches!(
         invalid,
-        Error::InvalidKeystroke { command: "new_tab", ref keystroke, .. } if keystroke == "cmd-n-t"
+        crate::Error::Keymap(Error::InvalidKeystroke { command: "new_tab", ref keystroke, .. }) if keystroke == "cmd-n-t"
     ));
     for keystroke in ["n", "shift-n"] {
         assert!(matches!(
             error(&[("new_tab", one(keystroke))]),
-            Error::KeystrokeWithoutModifier {
+            crate::Error::Keymap(Error::KeystrokeWithoutModifier {
                 command: "new_tab",
                 ..
-            }
+            })
         ));
     }
     assert!(matches!(
         error(&[("new_tab", Binding::Many(vec!["cmd-n".into(); 9]))]),
-        Error::TooManyKeystrokes("new_tab")
+        crate::Error::Keymap(Error::TooManyKeystrokes("new_tab"))
     ));
     assert!(matches!(
         error(&[("new_tab", one("cmd-k")), ("themes", one("cmd-k"))]),
-        Error::DuplicateKeystroke {
+        crate::Error::Keymap(Error::DuplicateKeystroke {
             first: "new_tab",
             second: "themes",
             ..
-        }
+        })
     ));
     // Repeating a keystroke within one command is harmless.
     with(&[(
@@ -289,16 +292,12 @@ fn the_prefix_yields_to_gui_config_and_typing() {
     assert!(!keymap.is_prefix(&keystroke("ctrl-b")));
     assert_eq!(keymap.chord(&keystroke("c")), None);
     assert_eq!(list(&keymap, Command::Tab), [default("cmd-t")]);
-    for (prefix, usable) in [
-        ("f12", true),
-        ("escape", true),
-        ("a", false),
-        ("shift-a", false),
-    ] {
+    // Any key Herdr accepts is a prefix, bare ones that type text included.
+    for prefix in ["f12", "escape", "a", "shift-a", "@"] {
         let keymap =
             Keymap::with_overrides(&BTreeMap::new(), &Default::default(), &keys(prefix)).unwrap();
-        assert_eq!(keymap.is_prefix(&keystroke(prefix)), usable, "{prefix}");
-        assert_eq!(keymap.chord(&keystroke("c")).is_some(), usable, "{prefix}");
+        assert!(keymap.is_prefix(&keystroke(prefix)), "{prefix}");
+        assert!(keymap.chord(&keystroke("c")).is_some(), "{prefix}");
     }
 }
 
@@ -327,10 +326,7 @@ fn custom_commands_bind_after_the_keymap() {
     let commands = [
         custom("git", &["prefix+y", "ctrl+alt+g"]),
         // Herdr's own chord for New Tab, which the keymap keeps.
-        custom(
-            "shadowed",
-            &["prefix+c", &default("cmd-t").replace('-', "+")],
-        ),
+        custom("shadowed", &["prefix+c"]),
         // A bare key would swallow typing, and the prefix is the prefix.
         custom("typing", &["u", "ctrl+b"]),
         custom("legacy", &[]),
@@ -347,7 +343,6 @@ fn custom_commands_bind_after_the_keymap() {
     assert_eq!(find("g", true), None);
     assert_eq!(find("ctrl-alt-g", true), None);
     assert_eq!(find("c", true), None);
-    assert_eq!(find(default("cmd-t"), false), None);
     assert_eq!(find("u", false), None);
     assert_eq!(find("ctrl-b", false), None);
     assert_eq!(running(&keymap, &commands, 0), ["ctrl-b y", "ctrl-alt-g"]);
@@ -359,11 +354,12 @@ fn custom_commands_bind_after_the_keymap() {
     assert!(running(&keymap, &old, 0).is_empty());
     assert!(keymap.custom_command(&old, &keystroke("g"), true).is_none());
     // Without a usable prefix no chord can reach one.
-    let keys = DaemonKeys {
-        prefixes: vec![keystroke("a")],
-        ..no_keys()
-    };
-    let keymap = Keymap::with_overrides(&BTreeMap::new(), &Default::default(), &keys).unwrap();
+    let keymap = Keymap::with_overrides(
+        &overrides(&[("themes", one("ctrl-b"))]),
+        &Default::default(),
+        &no_keys(),
+    )
+    .unwrap();
     assert!(
         keymap
             .custom_command(&commands, &keystroke("y"), true)
@@ -436,10 +432,10 @@ fn every_prefix_arms_and_the_first_labels_chords() {
     assert_eq!(keymap.chord(&keystroke("ctrl-s")), None);
     assert_eq!(list(&keymap, Command::NextTab), [default("cmd-shift-]")]);
 
-    // A prefix the GUI config claims, or that would swallow typing, is
-    // dropped, and the next one labels chords.
+    // A prefix the GUI config claims is dropped, and the next one labels
+    // chords.
     let keys = DaemonKeys {
-        prefixes: vec![keystroke("ctrl-b"), keystroke("a"), keystroke("ctrl-s")],
+        prefixes: vec![keystroke("ctrl-b"), keystroke("ctrl-s")],
         bindings: vec![(Command::Tab, Trigger::Prefixed(keystroke("c")))],
         ..no_keys()
     };
@@ -450,7 +446,6 @@ fn every_prefix_arms_and_the_first_labels_chords() {
     )
     .unwrap();
     assert!(!keymap.is_prefix(&keystroke("ctrl-b")));
-    assert!(!keymap.is_prefix(&keystroke("a")));
     assert!(keymap.is_prefix(&keystroke("ctrl-s")));
     assert_eq!(list(&keymap, Command::Tab), [default("cmd-t"), "ctrl-s c"]);
 }
@@ -462,24 +457,29 @@ fn pane_keys(entries: &[(&str, &str)]) -> PaneKeys {
         .collect()
 }
 
-fn sent<'a>(keymap: &'a Keymap, typed: &str) -> Option<&'a Keystroke> {
+fn sent<'a>(keymap: &'a Keymap, typed: &str) -> Option<&'a PaneKey> {
     keymap.pane_key(&keystroke(typed))
+}
+
+fn key(text: &str) -> PaneKey {
+    PaneKey::Key(keystroke(text))
 }
 
 #[test]
 fn default_pane_keys_follow_ghostty_on_macos() {
     let defaults = DEFAULT_PANE_KEYS
         .iter()
-        .map(|(typed, sent)| (keystroke(typed), keystroke(sent)));
+        .map(|(typed, sent)| (keystroke(typed), key(sent)));
     assert!(
-        defaults
-            .clone()
-            .all(|(_, sent)| crate::terminal::reaches_pane(&sent))
+        DEFAULT_PANE_KEYS
+            .iter()
+            .chain(PORTABLE_PANE_KEYS)
+            .all(|(_, sent)| crate::terminal::reaches_pane(&keystroke(sent)))
     );
     let keymap = Keymap::default();
     assert_eq!(
         keymap.pane_keys.len(),
-        if cfg!(target_os = "macos") { 5 } else { 0 }
+        if cfg!(target_os = "macos") { 6 } else { 1 }
     );
     // Defaults are replaced by keystroke, not spelling, or removed.
     let resolved = resolve_pane_keys(
@@ -494,11 +494,11 @@ fn default_pane_keys_follow_ghostty_on_macos() {
     assert_eq!(
         resolved,
         [
-            (keystroke("cmd-right"), keystroke("ctrl-e")),
-            (keystroke("alt-left"), keystroke("alt-b")),
-            (keystroke("alt-right"), keystroke("alt-f")),
-            (keystroke("cmd-left"), keystroke("home")),
-            (keystroke("ctrl-shift-enter"), keystroke("alt-enter")),
+            (keystroke("cmd-right"), key("ctrl-e")),
+            (keystroke("alt-left"), key("alt-b")),
+            (keystroke("alt-right"), key("alt-f")),
+            (keystroke("cmd-left"), key("home")),
+            (keystroke("ctrl-shift-enter"), key("alt-enter")),
         ]
     );
 }
@@ -516,7 +516,7 @@ fn pane_keys_take_keystrokes_from_default_and_daemon_commands() {
         ("ctrl-b", "ctrl-a"),
     ]);
     let keymap = Keymap::with_overrides(&BTreeMap::new(), &table, &keys).unwrap();
-    assert_eq!(sent(&keymap, default("cmd-k")), Some(&keystroke("ctrl-l")));
+    assert_eq!(sent(&keymap, default("cmd-k")), Some(&key("ctrl-l")));
     assert_eq!(keymap.primary(Command::ClearPane), "");
     assert_eq!(keymap.primary(Command::Themes), "");
     assert!(!keymap.is_prefix(&keystroke("ctrl-b")));
@@ -536,30 +536,30 @@ fn pane_keys_reject_typing_unsendable_targets_and_configured_commands() {
     };
     assert!(matches!(
         resolve(&[("a", "ctrl-a")], &[]),
-        Err(Error::PaneKeyWithoutModifier(_))
+        Err(crate::Error::Keymap(Error::PaneKeyWithoutModifier(_)))
     ));
     assert!(matches!(
         resolve(&[("shift-space", "ctrl-a")], &[]),
-        Err(Error::PaneKeyWithoutModifier(_))
+        Err(crate::Error::Keymap(Error::PaneKeyWithoutModifier(_)))
     ));
     assert!(matches!(
         resolve(&[("cmd-left", "cmd-a")], &[]),
-        Err(Error::UnsendablePaneKey { .. })
+        Err(crate::Error::Keymap(Error::UnsendablePaneKey { .. }))
     ));
     assert!(matches!(
         resolve(&[("cmd-left", "ctrl-nope-a")], &[]),
-        Err(Error::InvalidPaneKey { .. })
+        Err(crate::Error::Keymap(Error::InvalidPaneKey { .. }))
     ));
     assert!(matches!(
         resolve(&[("cmd-left", "ctrl-a"), ("super-left", "ctrl-e")], &[]),
-        Err(Error::DuplicatePaneKey(_))
+        Err(crate::Error::Keymap(Error::DuplicatePaneKey(_)))
     ));
     assert!(matches!(
         resolve(&[("cmd-y", "ctrl-a")], &[("new_tab", one("cmd-y"))]),
-        Err(Error::PaneKeyBound {
+        Err(crate::Error::Keymap(Error::PaneKeyBound {
             command: "new_tab",
             ..
-        })
+        }))
     ));
     // A key that cannot be text needs no modifier.
     assert!(resolve(&[("shift-enter", "alt-enter"), ("f13", "ctrl-u")], &[]).is_ok());
@@ -569,6 +569,6 @@ fn pane_keys_reject_typing_unsendable_targets_and_configured_commands() {
         .collect();
     assert!(matches!(
         Keymap::with_overrides(&BTreeMap::new(), &many, &no_keys()),
-        Err(Error::TooManyPaneKeys(MAX_PANE_KEYS))
+        Err(crate::Error::Keymap(Error::TooManyPaneKeys(MAX_PANE_KEYS)))
     ));
 }

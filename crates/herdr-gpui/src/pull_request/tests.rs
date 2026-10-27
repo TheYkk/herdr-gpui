@@ -1,36 +1,25 @@
-#![allow(clippy::unwrap_used)]
+use super::*;
 
-use super::{
-    Cache, Input, Lookup, Origin, Result, clean,
-    fetch::{OUTPUT_LIMIT, TIMEOUT, fetch, local_repository, remote_host, worktree_checkout},
-    fixture,
-    lookup::Worker,
-    model::{MergeState, State},
-    parse::{parse, parse_graphql},
-    run,
-};
-use crate::Error;
-use std::{
-    process::Command,
-    sync::{Arc, mpsc},
-    time::{Duration, Instant},
-};
+#[test]
+fn each_tone_takes_its_own_palette_color() {
+    let theme = crate::config::Theme::default();
+    for (tone, expected) in [
+        (Tone::Attention, theme.palette[1]),
+        (Tone::Held, theme.palette[208]),
+        (Tone::Merged, theme.palette[5]),
+        (Tone::Muted, theme.muted),
+        (Tone::Ready, theme.palette[2]),
+        (Tone::Waiting, theme.palette[3]),
+    ] {
+        assert_eq!(tone_color(tone, &theme), theme.ink(expected), "{tone:?}");
+    }
+}
 
-mod actions;
-mod by_number;
-mod cache;
-mod fetch;
-mod fork_branch;
-mod lookup;
-mod responses;
-mod upstream;
-mod workspace_directory;
-
-fn response() -> serde_json::Value {
-    serde_json::json!([{
-        "number":8, "url":"https://github.com/example/project/pull/8", "title":"Title\n\u{202e}safe",
-        "state":"OPEN", "isDraft":false, "headRefName":"feature", "baseRefName":"main",
-        "additions":1, "deletions":0, "changedFiles":1, "updatedAt":"now",
-        "mergeStateStatus":"UNKNOWN", "reviewDecision":"", "headRepositoryOwner":{"login":"example"}
-    }])
+#[test]
+fn a_badge_is_colored_by_its_tone() -> anyhow::Result<()> {
+    let theme = crate::config::Theme::default();
+    let mut pr = fixture()?;
+    pr.state = State::Merged;
+    assert_eq!(color(&pr, &theme), theme.ink(theme.palette[5]));
+    Ok(())
 }

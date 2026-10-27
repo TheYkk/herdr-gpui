@@ -1,9 +1,9 @@
 //! The window's periodic endpoint work: draining each connection, activating
 //! the selected surface, and probing sessions.
 use super::{ACTIVATION_TIMEOUT, LOCAL, Redraw};
-use crate::HerdrWindow;
+use crate::{HerdrWindow, avatars::Checkout};
 use gpui::{ClipboardItem, Context};
-use herdr_client::RemoteHost;
+use herdr_client::{ConnectTarget, RemoteHost};
 use std::time::Instant;
 
 impl HerdrWindow {
@@ -29,7 +29,11 @@ impl HerdrWindow {
     }
 
     pub(crate) fn poll_endpoints(&mut self, cx: &mut Context<Self>) {
-        self.recover_after_sleep(Instant::now(), std::time::SystemTime::now());
+        self.recover_connections(
+            Instant::now(),
+            std::time::SystemTime::now(),
+            super::wake::network_changes(),
+        );
         // Record the focused target the user last saw before a newer snapshot
         // can replace it; input held across a gap may only go there.
         self.flush_pending_input(cx);
@@ -62,6 +66,12 @@ impl HerdrWindow {
         // OSC 52 writes are drained per endpoint so they are written once and
         // never linger in a live state that a later poll would re-read.
         let mut clipboard_writes = std::collections::VecDeque::new();
+        // A device removed from the catalog is never followed again, so its
+        // avatar reads stop here rather than dialing a deleted host.
+        if let Some(avatars) = &mut self.avatars {
+            let endpoints = &self.endpoints;
+            avatars.keep_links(|id| endpoints.iter().any(|endpoint| endpoint.id == id));
+        }
         for (index, endpoint) in self.endpoints.iter_mut().enumerate() {
             let updated = endpoint.poll(Instant::now());
             clipboard_writes.append(&mut endpoint.live.clipboard_writes);
@@ -79,18 +89,45 @@ impl HerdrWindow {
                 Instant::now(),
             );
             changed = changed.max(updated);
-            // Remote cwd strings must never be resolved against this machine's Git repos.
-            if updated == Redraw::Window
-                && index == 0
+            // An SSH device's avatar reads follow its connection, before any
+            // request below, so a reconnection's first snapshot asks again.
+            if let (Some(avatars), ConnectTarget::Ssh { target, .. }) =
+                (&mut self.avatars, &endpoint.connection.target)
+            {
+                avatars.follow(&endpoint.id, target, endpoint.online_since());
+            }
+            // Remote cwd strings must never be resolved against this machine's
+            // Git repos; `Checkout::of` reads a saved SSH device's over SSH.
+            // A failed read is asked again once due, even on an idle host that
+            // sends no new snapshot.
+            let now = Instant::now();
+            if endpoint.online_since().is_some()
                 && let (Some(avatars), Some(snapshot)) =
                     (&mut self.avatars, &endpoint.live.snapshot)
+                && (updated == Redraw::Window
+                    || matches!(&endpoint.connection.target,
+                        ConnectTarget::Ssh { target, .. } if avatars.retry_due(target, now)))
             {
+                let target = &endpoint.connection.target;
                 for workspace in &snapshot.workspaces {
-                    avatars.request(&workspace.new_workspace_cwd);
+                    if let Some(checkout) = Checkout::of(index == 0, target, workspace) {
+                        avatars.request(checkout, now);
+                    }
+                }
+                if let ConnectTarget::Ssh { target: host, .. } = target {
+                    avatars.forget_unlisted(host, |dir| {
+                        snapshot.workspaces.iter().any(|workspace| {
+                            matches!(
+                                Checkout::of(index == 0, target, workspace),
+                                Some(Checkout::Ssh { dir: listed, .. }) if listed == dir
+                            )
+                        })
+                    });
                 }
             }
             if endpoint.enabled
                 && !endpoint.detached
+                && !endpoint.suspended()
                 && endpoint.connection.handle.is_none()
                 && Instant::now() >= endpoint.retry_at
             {
@@ -98,7 +135,19 @@ impl HerdrWindow {
                 selected_changed |= index == self.selected_endpoint;
                 changed = Redraw::Window;
             }
+            // Only a requested surface flushes, which in practice is the
+            // selected endpoint's, so its error is the one the window shows.
+            if let Err(error) = endpoint.flush_config_reload()
+                && index == self.selected_endpoint
+            {
+                self.local_error = Some(format!("Reload config: {error}"));
+            }
         }
+        crate::palette::LastSeen::trim(
+            self.endpoints
+                .iter_mut()
+                .map(|endpoint| &mut endpoint.last_seen),
+        );
         if self.apply_clipboard_writes(clipboard_writes, cx) {
             changed = Redraw::Window;
         }
@@ -154,7 +203,7 @@ impl HerdrWindow {
                 .and_then(|()| handle.set_surface_active(&snapshot.boot_id, true));
             match result {
                 Ok(request) => {
-                    state.surface = None;
+                    state.invalidate_surface();
                     state.activation = Some(crate::state::SurfaceActivation {
                         request,
                         boot: snapshot.boot_id.clone(),

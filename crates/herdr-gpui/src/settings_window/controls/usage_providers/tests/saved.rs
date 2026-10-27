@@ -8,7 +8,7 @@ fn saved_config() -> Config {
         .providers
         .entry("openrouter".into())
         .or_default();
-    *settings = std::mem::take(settings).with("api_key", "test-only-key");
+    *settings = toml::from_str("api_key = 'test-only-key'").unwrap();
     config
         .usage
         .providers

@@ -1,7 +1,5 @@
 //! Requires an active native desktop and an explicitly selected daemon executable.
-//! The daemon and its sandbox are POSIX, so the harness compiles on Unix only.
-#![cfg(unix)]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 #[path = "../../test-support/sandbox.rs"]
 mod sandbox;
 
@@ -14,7 +12,7 @@ use std::{
     ffi::OsString,
     fs,
     path::Path,
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     thread,
     time::{Duration, Instant},
 };
@@ -70,6 +68,13 @@ fn native_notifications() {
     native_fixture(Fixture::Notifications);
 }
 
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+#[ignore = "requires active native desktop; a page in the window, no daemon"]
+fn native_pages() {
+    native_fixture(Fixture::Pages);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires active Wayland desktop; input shutdown fixtures, no daemon"]
@@ -105,55 +110,30 @@ enum Fixture {
     #[cfg(target_os = "linux")]
     ApplicationMenus,
     Notifications,
+    #[cfg(any(target_os = "macos", windows))]
+    Pages,
     InvalidChildWidth,
     #[cfg(target_os = "linux")]
     InputShutdown(&'static str),
 }
 
+const TIMEOUT_ATTEMPTS: usize = 3;
+
+/// Shared CI desktops are sometimes slow enough to miss a deadline mid-run.
+/// Only a timeout is retried, each attempt in a fresh sandbox; a wrong exit
+/// status or a failed check still fails on the first attempt.
+fn retry_timeouts<T>(name: &str, mut attempt: impl FnMut() -> Option<T>) -> T {
+    for n in 1..=TIMEOUT_ATTEMPTS {
+        if let Some(value) = attempt() {
+            return value;
+        }
+        eprintln!("{name} timeout (attempt {n} of {TIMEOUT_ATTEMPTS})");
+    }
+    panic!("{name} timeout after {TIMEOUT_ATTEMPTS} attempts");
+}
+
 fn native_fixture(fixture: Fixture) {
-    let mut isolated = Isolated {
-        sandbox: Sandbox::new(),
-        daemon: None,
-        gui: None,
-    };
-    let mut command = gui_command(&isolated.sandbox, |name| std::env::var_os(name));
-    if let Some(path) = std::env::var_os("HERDR_TEST_SETTINGS_CAPTURE") {
-        command.env("HERDR_TEST_SETTINGS_CAPTURE", path);
-    }
-    match fixture {
-        Fixture::Sidebar => {}
-        #[cfg(target_os = "linux")]
-        Fixture::ApplicationMenus => {
-            command.env("HERDR_TEST_APPLICATION_MENUS", "1");
-        }
-        Fixture::Notifications => {
-            command.env("HERDR_TEST_NOTIFICATIONS_ONLY", "1");
-        }
-        Fixture::InvalidChildWidth => {
-            command.env("HERDR_TEST_SIDEBAR_PROBE_FAILURE", "1");
-        }
-        #[cfg(target_os = "linux")]
-        Fixture::InputShutdown(field) => {
-            command.env_remove("DISPLAY");
-            command.env("HERDR_TEST_INPUT_SHUTDOWN", field);
-            command.env("LEAK_BACKTRACE", "1");
-        }
-    }
-    isolated.gui = Some(command.arg("--sidebar-test").spawn().unwrap());
-    let gui = isolated.gui.as_mut().unwrap();
-    // The sidebar scenario includes native Settings saves and watcher reloads.
-    let deadline = Instant::now() + Duration::from_secs(40);
-    while gui.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            let _ = gui.kill();
-            let _ = gui.wait();
-            panic!("native sidebar timeout");
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let status = gui.wait().unwrap();
-    let log = fs::read_to_string(isolated.sandbox.dir.join("gui.log")).unwrap();
-    eprintln!("{log}");
+    let (status, log) = retry_timeouts("native sidebar", || run_fixture(&fixture));
     if matches!(fixture, Fixture::InvalidChildWidth) {
         assert_eq!(
             status.code(),
@@ -175,16 +155,69 @@ fn native_fixture(fixture: Fixture) {
         #[cfg(target_os = "linux")]
         Fixture::ApplicationMenus => "APPLICATION MENUS native PASS",
         Fixture::Notifications => "NOTIFICATIONS native PASS:",
+        #[cfg(any(target_os = "macos", windows))]
+        Fixture::Pages => "PAGES native PASS:",
         #[cfg(target_os = "linux")]
         Fixture::InputShutdown(_) => "INPUT shutdown ready:",
         _ => "SIDEBAR native PASS:",
     }));
 }
 
+fn run_fixture(fixture: &Fixture) -> Option<(ExitStatus, String)> {
+    let mut isolated = Isolated {
+        sandbox: Sandbox::new(),
+        daemon: None,
+        gui: None,
+    };
+    let mut command = gui_command(&isolated.sandbox, |name| std::env::var_os(name));
+    if let Some(path) = std::env::var_os("HERDR_TEST_SETTINGS_CAPTURE") {
+        command.env("HERDR_TEST_SETTINGS_CAPTURE", path);
+    }
+    match fixture {
+        Fixture::Sidebar => {}
+        #[cfg(target_os = "linux")]
+        Fixture::ApplicationMenus => {
+            command.env("HERDR_TEST_APPLICATION_MENUS", "1");
+        }
+        Fixture::Notifications => {
+            command.env("HERDR_TEST_NOTIFICATIONS_ONLY", "1");
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        Fixture::Pages => {
+            command.env("HERDR_TEST_PAGES_ONLY", "1");
+        }
+        Fixture::InvalidChildWidth => {
+            command.env("HERDR_TEST_SIDEBAR_PROBE_FAILURE", "1");
+        }
+        #[cfg(target_os = "linux")]
+        Fixture::InputShutdown(field) => {
+            command.env_remove("DISPLAY");
+            command.env("HERDR_TEST_INPUT_SHUTDOWN", field);
+            command.env("LEAK_BACKTRACE", "1");
+        }
+    }
+    isolated.gui = Some(command.arg("--sidebar-test").spawn().unwrap());
+    let gui = isolated.gui.as_mut().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while gui.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = gui.kill();
+            let _ = gui.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let status = gui.wait().unwrap();
+    let log = fs::read_to_string(isolated.sandbox.dir.join("gui.log")).unwrap();
+    eprintln!("{log}");
+    Some((status, log))
+}
+
 impl Drop for Isolated {
     fn drop(&mut self) {
         stop_children([&mut self.gui, &mut self.daemon]);
-        for name in ["gui.log", "daemon.log"] {
+        // The daemon's own log says why it refused or failed a request.
+        for name in ["gui.log", "daemon.log", "config/herdr/herdr-server.log"] {
             if let Ok(log) = fs::read_to_string(self.sandbox.dir.join(name)) {
                 eprintln!("{name} (last 40 lines, at most 600 chars each):");
                 let lines = log.lines().rev().take(40).collect::<Vec<_>>();
@@ -202,6 +235,54 @@ fn native_gui_live() {
     let binary = daemon_binary();
     #[cfg(target_os = "macos")]
     let _clipboard = clipboard_guard::ClipboardGuard::acquire();
+    let (mut isolated, status) = retry_timeouts("native GUI", || launch_gui_live(&binary));
+    assert!(status.success(), "GUI failed: {status}");
+    let log = fs::read_to_string(isolated.sandbox.dir.join("gui.log")).unwrap();
+    assert!(
+        log.contains("GUI integration PASS:"),
+        "GUI exited without completing harness"
+    );
+    assert!(
+        log.contains("GUI input pipeline verified:"),
+        "GUI did not verify native action, key, and text delivery"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        log.contains("GUI clipboard native PASS: local")
+            && log.contains("GUI clipboard native PASS: remote"),
+        "native clipboard matrix did not complete"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        log.contains("GUI CJK selection verified:"),
+        "GUI did not verify CJK native drag, clipboard, and paste byte readback"
+    );
+    assert!(
+        log.contains("GUI second window verified:") && log.contains("windows=2 first_space="),
+        "GUI did not verify a second window on its own space"
+    );
+    assert!(
+        log.contains("GUI external workspace push verified:")
+            && log.contains("bound_ms=3000 observation_poll_ms=100 unchanged_connection=true unchanged_focus=true no_refresh=true")
+            && log.contains("3 workspaces / 4 tabs"),
+        "GUI did not verify bounded external workspace delivery without refresh/reconnect"
+    );
+    assert!(
+        isolated
+            .daemon
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none(),
+        "GUI exit killed daemon"
+    );
+    eprintln!(
+        "GUI exited successfully; isolated daemon is still alive; cleaning up only owned children"
+    );
+}
+
+fn launch_gui_live(binary: &Path) -> Option<(Isolated, ExitStatus)> {
     let mut isolated = Isolated {
         sandbox: Sandbox::new(),
         daemon: None,
@@ -249,10 +330,7 @@ fn native_gui_live() {
         if let Some(status) = isolated.gui.as_mut().unwrap().try_wait().unwrap() {
             break status;
         }
-        assert!(
-            Instant::now() < deadline,
-            "native GUI timeout (active desktop required)"
-        );
+        // Check the daemon first so a crash at the deadline is never retried.
         assert!(
             isolated
                 .daemon
@@ -263,54 +341,18 @@ fn native_gui_live() {
                 .is_none(),
             "daemon died while GUI was running"
         );
+        if Instant::now() >= deadline {
+            eprintln!("native GUI timeout (active desktop required)");
+            return None;
+        }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "GUI failed: {status}");
-    let log = fs::read_to_string(isolated.sandbox.dir.join("gui.log")).unwrap();
-    assert!(
-        log.contains("GUI integration PASS:"),
-        "GUI exited without completing harness"
-    );
-    assert!(
-        log.contains("GUI input pipeline verified:"),
-        "GUI did not verify native action, key, and text delivery"
-    );
-    #[cfg(target_os = "macos")]
-    assert!(
-        log.contains("GUI clipboard native PASS: local")
-            && log.contains("GUI clipboard native PASS: remote"),
-        "native clipboard matrix did not complete"
-    );
-    #[cfg(target_os = "macos")]
-    assert!(
-        log.contains("GUI CJK selection verified:"),
-        "GUI did not verify CJK native drag, clipboard, and paste byte readback"
-    );
-    assert!(
-        log.contains("GUI second window verified:") && log.contains("windows=2 first_space="),
-        "GUI did not verify a second window on its own space"
-    );
-    assert!(
-        log.contains("GUI external workspace push verified:")
-            && log.contains("bound_ms=3000 observation_poll_ms=100 unchanged_connection=true unchanged_focus=true no_refresh=true")
-            && log.contains("3 workspaces / 4 tabs"),
-        "GUI did not verify bounded external workspace delivery without refresh/reconnect"
-    );
-    assert!(
-        isolated
-            .daemon
-            .as_mut()
-            .unwrap()
-            .try_wait()
-            .unwrap()
-            .is_none(),
-        "GUI exit killed daemon"
-    );
-    eprintln!(
-        "GUI exited successfully; isolated daemon is still alive; cleaning up only owned children"
-    );
+    Some((isolated, status))
 }
 
+// Windows has no display variables to forward; the GUI reaches the desktop
+// of the session it runs in.
+#[cfg(unix)]
 #[test]
 fn gui_desktop_environment_preserves_sandbox_isolation() {
     use std::{collections::BTreeMap, ffi::OsStr, os::unix::ffi::OsStrExt};

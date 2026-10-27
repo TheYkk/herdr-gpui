@@ -2,6 +2,7 @@
 use crate::{icons::AgentIcon, navigation::NavigationTarget};
 use herdr_client::protocol::ClientShellSnapshot;
 use herdr_client::protocol::{SemanticNotification, SemanticNotificationKind, ToastHerdrPosition};
+pub(crate) use herdr_client::text::{safe_text, unsafe_char};
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -13,6 +14,7 @@ const GRACE: Duration = Duration::from_secs(1);
 const RECHECK: Duration = Duration::from_millis(50);
 static ARRIVAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+mod context;
 #[cfg(test)]
 mod policy_tests;
 
@@ -42,20 +44,8 @@ pub(crate) struct Notice {
     /// Handed to the OS notification center. Retained only so a click can
     /// resolve its target through the same boot-fenced validation as a toast.
     pub(crate) posted: bool,
-}
-
-pub(crate) fn safe_text(text: &str, limit: usize) -> String {
-    // Bound scanning as well as output, even for a payload made entirely of controls.
-    text.chars()
-        .take(limit)
-        .filter(|c| !unsafe_char(*c))
-        .collect()
-}
-
-/// A control or direction-override character, which untrusted text loses.
-pub(crate) fn unsafe_char(c: char) -> bool {
-    c.is_control()
-        || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{2028}' | '\u{2029}')
+    /// The body is the client's task and place lines, each shown on one row.
+    pub(crate) described: bool,
 }
 
 impl Notice {
@@ -161,6 +151,7 @@ impl Notice {
             displayed: None,
             suppression_target,
             posted: false,
+            described: false,
         }
     }
 
@@ -199,6 +190,22 @@ impl Notice {
             }
         }
         self.initialized = self.resolve_target(snapshot).is_some();
+        // Name the agent's task and place from the same validated snapshot.
+        // Custom notices carry the sender's own text, which stays.
+        if self.initialized
+            && !self.client_local
+            && matches!(
+                self.kind,
+                SemanticNotificationKind::NeedsAttention | SemanticNotificationKind::Finished
+            )
+            && let Some(body) = self
+                .pane_id
+                .as_deref()
+                .and_then(|pane| context::describe(snapshot, pane))
+        {
+            self.body = Some(body);
+            self.described = true;
+        }
     }
 
     pub fn target<'a>(
@@ -311,11 +318,12 @@ pub(crate) fn tick(
     let system = delivery == Delivery::System;
     let mut changed = false;
     for (index, endpoint) in endpoints.iter_mut().enumerate() {
-        let snapshot = endpoint.live.snapshot.as_deref();
+        let snapshot = endpoint.live.latest_snapshot().map(std::sync::Arc::as_ref);
         endpoint.toasts.entries.retain_mut(|(id, n)| {
             let keep = (|| {
                 if !n.client_local
                     && (delivery == Delivery::Off
+                        || (n.kind == Kind::Finished && !config.finished)
                         || endpoint
                             .toasts
                             .enabled_since
@@ -517,6 +525,7 @@ pub(crate) fn take_system(
 pub(crate) mod tests {
     use super::*;
 
+    mod context;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     mod local_feedback;
 

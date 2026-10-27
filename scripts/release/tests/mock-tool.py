@@ -17,6 +17,13 @@ with open(os.environ["MOCK_LOG"], "a") as log:
     log.write(json.dumps([tool, *args]) + "\n")
 if os.environ.get("MOCK_FAIL") == tool:
     sys.exit(1)
+# The first MOCK_XCRUN_FAILURES xcrun calls fail, like a dropped connection.
+if tool == "xcrun" and os.environ.get("MOCK_XCRUN_FAILURES"):
+    counter = Path(os.environ["HOME"]) / "xcrun-failures"
+    failed = int(counter.read_text()) if counter.exists() else 0
+    if failed < int(os.environ["MOCK_XCRUN_FAILURES"]):
+        counter.write_text(str(failed + 1))
+        sys.exit(1)
 if tool == "security":
     if args == ["list-keychains", "-d", "user"]:
         print('    "/mock/login keychain-db"\n    "/mock/system.keychain"')
@@ -33,7 +40,9 @@ elif tool == "plutil" and args[0] == "-extract":
     print("14.2" if args[1] == "LSMinimumSystemVersion" else "20260920.3")
 elif tool == "lipo":
     if args[0] == "-archs":
-        print(Path(args[1]).name)
+        # A fixture is named for its architecture, or sits in a folder that is.
+        path = Path(args[1])
+        print(path.name if path.name in ("arm64", "x86_64") else path.parent.name)
     elif args[0] == "-create":
         Path(args[-1]).write_text("never execute this fixture")
     else:
